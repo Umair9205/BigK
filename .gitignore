@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+
+# Expo
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+
+# Logs (local test evidence; referenced by filename in the docs)
+*.log
+
+# Archives that exceed GitHub's 100 MB file limit
+kela-konnect.zip
+
+# Local backups and scratch build output
+.codex-backups/
+opus_host_build/
+opus_host_test
+
+# Android / Gradle build outputs
+android/.gradle/
+android/build/
+android/app/build/
+android/app/.cxx/
+.gradle/
+*.apk
+*.aab
+
+# Machine-specific SDK paths
+android/local.properties
+
+# IDE / OS
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
