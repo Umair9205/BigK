@@ -611,33 +611,74 @@ Keep-alive is demoted: retained for observability (the counter line is now
 the instrument), stock-Android Doze, and borderline devices — not as the
 Infinix fix.
 
-Also in this capture: uid 10302 was bump-frozen 14× in two minutes (each at
-`speed :0`, ~10 s apart) — XOS push-bump churn: GCM bumps an app, it
-handles, it is re-frozen. We have no push channel (and no server to originate
-one), so that cycle is not available to us.
+### The wake mechanism XOS does allow (two more findings from this log)
 
-### Round 22 = the XOS settings pass (free, same APK)
+1. **WhatsApp survives by being *woken*, not by being *spared*.** Twice in
+   this capture: `unfreeze uid: 10302 com.whatsapp … reason:asyncBinderWhiteList
+   cpninfo:TRANSACTION_2 … last freeze 0s ago` → `transition from Frozen to
+   Running, reason=asyncBinderWhiteList` (21:46:47.9 and 21:47:23.9), then
+   re-frozen. XOS unfreezes a frozen app when an async binder transaction
+   from a whitelisted source arrives — for WhatsApp that source is its GMS
+   push channel (its 14× freeze/unfreeze churn in this capture is that
+   heartbeat). We have no push channel (and no server to originate one), but
+   the *mechanism* is reachable from any whitelisted source — GMS and
+   `system_server` above all.
+2. **GMS kept OUR Nearby discovery alive through the whole freeze.**
+   `NearbyMediums: Current Tracked Scanning Clients are : {…,
+   com.kelakonnect.nearby.control.v2}` printed every ~8 s from 21:46:42 to
+   21:48:59 — that is our own `SERVICE_ID` (`NearbyTransport.kt`), so GMS
+   kept scanning **on our behalf for 2+ minutes after the freeze at
+   21:46:49** (pre-freeze probes also showed `advertising=true`; same
+   registration family). When a friend's phone advertises, GMS will find it
+   and must deliver `onEndpointFound`/connection callbacks into our frozen
+   process — *the exact class of transaction that unfroze WhatsApp*.
+3. Post-freeze, the only mentions of our package are proxy lines (wakelock
+   force-release, `idleUids`, `p_job`/`p_alarm`/`p_sensor`) — nothing
+   attempted delivery, because nobody was advertising near us during this
+   test. **Every freeze test so far had no caller: the wake path has never
+   been exercised.**
 
-If XOS's own toggles stop the freeze, the walk-away range test unblocks
-immediately. The shipped answer still cannot be the toggles (no-precondition
-rule) — that remains CDM presence observation — but both the range number and
-the whitelist-model confirmation are worth a 5-minute measurement.
+### Round 22 = does a real call wake the frozen callee? (no build)
 
-Toggles (XOS names drift between versions; note anything missing):
+The user confirms all four XOS toggles were already in place before round
+21 — so that freeze is a *provisional* negative for the settings pass. One
+caveat worth a 10-second look: the reinstall changed our uid (10392 →
+10393) and XOS's auto-start/protected lists sometimes reset on reinstall —
+if BigK dropped out of any list, re-add it (restores one clean measurement).
+If all four still list BigK, the pass is dead and stays dead.
 
-1. Settings → App management → BigK → Battery → **Unrestricted**.
-2. Settings → App management → **Auto-start management** → allow BigK.
-3. Phone Master → **Protected apps** (or Auto-start) → enable BigK.
-4. Recents → lock BigK's card (XOS lock — swipe-*down* on the card; never
-   swipe-up, that is a real kill).
+What matters more: the existing Nearby path may *already* receive in
+background through the GMS-wake mechanism above. Test it directly —
+**Infinix = callee (USB attached), Samsung = caller:**
 
-Then repeat the background-survival checklist on this same APK: open once →
-Home → 2 min → capture → same greps.
+1. `adb logcat -G 8M` → `adb logcat -c`.
+2. Sanity first: one call with the callee in the foreground (must work
+   before the background test means anything).
+3. Open BigK once on the Infinix → press Home → wait 60 s (frozen by then —
+   same pattern as rounds 19–21).
+4. On the Samsung: press Call on the Infinix contact. Watch the Infinix
+   screen for ~60 s — does it ring (UI or notification)? Caller showing
+   "did not respond" while the callee stays silent = the negative result.
+5. `adb logcat -d -v threadtime > log_bigk_infinix_22.log` and send it.
 
-- **No `enter FrozenState` for our uid, probes to the end** → whitelist
-  model confirmed → walk-away range test immediately.
-- **Freeze persists despite the toggles** → XOS ignores its own whitelist
-  for us → CDM presence observation next (build).
+Greps: `unfreeze uid: 10393` (any reason), `asyncBinderWhiteList`,
+`onEndpointFound|onIncoming|onConnectionResult`, `KeepAlive:`,
+`NearbyProbe:`, `enter FrozenState`, plus the Nearby lines in the call
+window (did GMS see the caller at all?).
+
+Discriminator:
+
+- **Unfreeze + ring** → background receive works through the existing path
+  → answer it, then straight to the walk-away range test (next small build
+  then = callee auto-answer so it can pick up unattended).
+- **Caller "did not respond", callee log shows GMS saw/notified us but no
+  unfreeze** → GMS delivery does not wake us (whitelist is target-based)
+  → CDM presence observation build — same wake class, `system_server`
+  source.
+- **Caller "did not respond", GMS never saw the caller** → advertising or
+  discovery died with the freeze — a different bug; fix that first.
+- **No freeze this round** (the reinstall had reset the toggles and they
+  are now fixed) → range test directly.
 
 ---
 
@@ -726,8 +767,11 @@ log and round-21 build sections above.
 sends, 17.5 KB/s TX, 2.8 KB/s RX — moved the metric from `speed :0` to
 `speed :8`, and the freezer froze the app anyway, Home +5.0 s.** Traffic is
 not the sparing lever on this phone (threshold above 8, or not consulted at
-all). Remaining candidates: the XOS settings pass (round 22, free,
-measurement) and CDM presence observation (structural, shipped path).
+all). The XOS settings pass was already applied before this test —
+provisionally negative (verify the reinstall didn't reset the lists). The
+round-22 experiment: does an incoming Nearby connection wake us via the GMS
+`asyncBinderWhiteList` mechanism (GMS kept our discovery registered through
+the freeze)? CDM presence observation remains the structural fallback.
 
 What the exemption is still good for: stock Android Doze on non-Transsion
 phones. It stays — it cost nothing and is required there. It is not the
@@ -748,23 +792,32 @@ Built anyway (Nov 4, APK 10:40 PM), kept as the stock-Android path:
 
 Remaining options for the Infinix, in the order they should be tried:
 
-1. **XOS one-time setup pass** (user-side, free, do first as a *measurement*):
-   manual, conflicts with the no-precondition rule, and XOS 15.1.2 owners
-   report the toggles get renamed/removed by updates: Settings → App
-   management → BigK → Battery → Unrestricted; enable in Auto-start
-   management; Phone Master → Protected apps; lock the card in Recents. Worth
-   knowing whether it stops the freeze at all, even if it can never be the
-   shipped answer.
-2. **Traffic keep-alive — v1 FAILED (round 20 log), v2 FAILED (round 21
+1. **Does an incoming Nearby connection wake the frozen callee?** (round-22
+   experiment, no build — protocol in the round-21 log section above.) GMS
+   kept our discovery client registered through the freeze, and GMS async
+   binder transactions are the class that unfroze WhatsApp
+   (`reason:asyncBinderWhiteList`) — so the *existing* path may already
+   receive in background. Every freeze test so far had nobody calling; this
+   is the missing measurement, and it gates everything below.
+2. **XOS one-time setup pass — ALREADY APPLIED before round 21 →
+   provisionally NEGATIVE.** All four toggles (Battery → Unrestricted,
+   Auto-start management, Phone Master → Protected apps, Recents lock) were
+   in place and the freeze still fired at Home +5 s. Caveat: the reinstall
+   changed uid (10393) and XOS lists sometimes reset on reinstall — verify
+   BigK is still listed in all four; if anything dropped, re-add it for one
+   clean measurement. Manual and conflicting with the no-precondition rule
+   either way — never the shipped answer.
+3. **Traffic keep-alive — v1 FAILED (round 20 log), v2 FAILED (round 21
    log).** v2 moved the metric (`speed :8`, 17.5 KB/s TX / 2.8 KB/s RX,
    `err=0`) and the freeze happened anyway at Home +5 s. Demoted to
    observability + stock-Android niceness; not the Infinix fix. The counter
    line (`KeepAlive: n= … txB= …`) stays as the instrument.
-3. **CDM presence observation** — the only path where the *system* wakes us
+4. **CDM presence observation** — the only path where the *system* wakes us
    when the friend's phone appears, surviving a frozen or even dead process.
    Unproven against `Usf_Hiber` (which proxies `p_service`), API 31+ only
    (Infinix ✅, Samsung ✗ but doesn't freeze anyway), costs one consent dialog
-   during QR pairing. Reserve decision already on file; next if 1 and 2 fail.
+   during QR pairing. Reserve decision already on file; next if the round-22
+   experiment is negative.
 
 ### Deferred / not built
 
@@ -812,15 +865,18 @@ Remaining options for the Infinix, in the order they should be tried:
    then for the OEM freezer:
    `Usf_Hiber.*<our-uid>` / `proxyWakeLock.*kelakonnect`.
    A freeze with **no** stop line is the round-18 bug reproducing.
-   **Round-22 = the XOS settings pass** (round-21 log settled the traffic
-   question: `speed :8` and a freeze anyway). Apply the four toggles from
-   the round-21 log section — Battery → Unrestricted, Auto-start management,
-   Phone Master → Protected apps, Recents lock — then repeat this checklist
-   on the same APK:
-   - No `enter FrozenState` for our uid and probes to the end → whitelist
-     model confirmed → **walk-away range test immediately** on this APK.
-   - Freeze persists despite the toggles → XOS ignores its own whitelist
-     for us → CDM presence observation is next (build).
+   **Round-22 = the background call wake experiment** (XOS toggles were
+   already applied before round 21 — provisionally negative; full protocol
+   in the round-21 log section): callee Infinix frozen ≥60 s on USB, caller
+   Samsung presses Call, capture with `logcat -d` afterwards. Greps:
+   `unfreeze uid: <our-uid>` (any reason), `asyncBinderWhiteList`,
+   `onEndpointFound|onIncoming|onConnectionResult`, `KeepAlive:`,
+   `NearbyProbe:`, `enter FrozenState`.
+   - Unfreeze + ring → background receive works → **walk-away range test**
+     (callee auto-answer build next so it can pick up unattended).
+   - Silence while GMS saw the caller → CDM presence observation build.
+   - GMS never saw the caller → advertising/discovery died with the freeze —
+     fix that first.
 4. Only once (2) passes is the walk-away test worth running: no calls during
    the walk, don't open either app, walk 30 s past the point you are sure both
    are dead, capture **both** logs, and note your paces (≈0.7 m each).
