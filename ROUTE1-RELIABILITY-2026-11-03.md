@@ -563,6 +563,84 @@ exit 0, `assembleRelease` BUILD SUCCESSFUL, APK 57.6 MB (Nov 5 21:34).
 
 ---
 
+## Round 21 log (Nov 5) — traffic registered, and the freeze happened anyway
+
+`log_bigk_infinix_21.log` (1.7 MB, 21:46:42 → 21:49:04). Reinstall → uid
+10393, pid 16098. logcat was cleared at 21:46:42, ~15 s after the keep-alive
+started, so the `starting`/`sending` lines predate the capture — the n=20
+counter line proves the ticker had been running 20 s.
+
+### Timeline
+
+| Time | Event |
+|---|---|
+| ~21:46:27 | keep-alive started (`n=20` at 21:46:47.726 ⇒ first tick ~21:46:28) |
+| 21:46:42.7 | watchdog probe running, 5 s cadence ✓ |
+| 21:46:44.226 | **Home** (APP_SWITCH → XOSLauncher) |
+| 21:46:47.726 | `KeepAlive: n=20 sent=380 err=0 rxPkt=54 tlsOk=10 tlsFail=22 txB=351036 rxB=56626 phase=burst wifi=true` |
+| 21:46:49.245 | `isTrafficActive uid:10393 speed :8` → `enter FrozenState` → **freeze, Home +5.0 s** |
+| 21:46:49.252 | `kelakonnect:availability` wakelock force-released; `p_service/p_alarm/p_sensor/p_job` proxied |
+| 21:46:52.262 | `netd socketDestroy(10393)` |
+| after | pid 16098 total silence (own last line 21:46:47.728), no n=30 line, no `stopped`; capture ends 21:49:04 with the process still frozen |
+
+### Verdict
+
+**v2's machinery worked, the metric MOVED (`speed :0` → `speed :8`), and the
+freezer froze us anyway — Home +5.0 s, exactly as rounds 19 and 20.**
+
+- Sends: 380/380 succeeded (`err=0`); txB = 351 KB over 20 s ≈ **17.5 KB/s**
+  — the burst rate landed.
+- RX: 54 replies drained, 10 TLS handshakes completed (22 failed fast);
+  rxB = 56 KB ≈ **2.8 KB/s** — the RX path works too.
+- The metric is therefore **numeric, not binary** (round-20's 0/1 observation
+  was just low traffic everywhere) and it does read this phone's Wi-Fi uid
+  traffic. `:8` ≈ total bytes over a multi-tens-of-seconds window in KB/s —
+  ramp-limited: full burst rate would read ~17 once the window is saturated.
+
+**Discriminator branch fired: `speed :N` with N > 0 and a freeze anyway →
+traffic is not the (only) lever.** Either the sparing threshold sits above 8
+— and any volume that might beat it (tens of KB/s at every background
+transition) is not shippable as an always-on burner — or the background+5 s
+decision does not consult the metric for sparing at all. Round 19's note
+that XOS froze WhatsApp/ChatGPT/Claude too now reads as the standard XOS
+model: **third-party apps are frozen +5 s after backgrounding unless
+whitelisted by XOS's own toggles; `isTrafficActive` is telemetry or gates
+something subtler.**
+
+Keep-alive is demoted: retained for observability (the counter line is now
+the instrument), stock-Android Doze, and borderline devices — not as the
+Infinix fix.
+
+Also in this capture: uid 10302 was bump-frozen 14× in two minutes (each at
+`speed :0`, ~10 s apart) — XOS push-bump churn: GCM bumps an app, it
+handles, it is re-frozen. We have no push channel (and no server to originate
+one), so that cycle is not available to us.
+
+### Round 22 = the XOS settings pass (free, same APK)
+
+If XOS's own toggles stop the freeze, the walk-away range test unblocks
+immediately. The shipped answer still cannot be the toggles (no-precondition
+rule) — that remains CDM presence observation — but both the range number and
+the whitelist-model confirmation are worth a 5-minute measurement.
+
+Toggles (XOS names drift between versions; note anything missing):
+
+1. Settings → App management → BigK → Battery → **Unrestricted**.
+2. Settings → App management → **Auto-start management** → allow BigK.
+3. Phone Master → **Protected apps** (or Auto-start) → enable BigK.
+4. Recents → lock BigK's card (XOS lock — swipe-*down* on the card; never
+   swipe-up, that is a real kill).
+
+Then repeat the background-survival checklist on this same APK: open once →
+Home → 2 min → capture → same greps.
+
+- **No `enter FrozenState` for our uid, probes to the end** → whitelist
+  model confirmed → walk-away range test immediately.
+- **Freeze persists despite the toggles** → XOS ignores its own whitelist
+  for us → CDM presence observation next (build).
+
+---
+
 ## Decisions that shaped this stretch
 
 - **`play-services-nearby:18.7.0` has no lifecycle callbacks** — verified with
@@ -644,6 +722,13 @@ send 02:12:31, Home 02:12:32 — and the freezer still logged
 v2 (burst volume + RX probes + logcat counters) is built; see the round-20
 log and round-21 build sections above.
 
+**Status after round 21 (Nov 5): v2 kept the traffic flowing — 380/380
+sends, 17.5 KB/s TX, 2.8 KB/s RX — moved the metric from `speed :0` to
+`speed :8`, and the freezer froze the app anyway, Home +5.0 s.** Traffic is
+not the sparing lever on this phone (threshold above 8, or not consulted at
+all). Remaining candidates: the XOS settings pass (round 22, free,
+measurement) and CDM presence observation (structural, shipped path).
+
 What the exemption is still good for: stock Android Doze on non-Transsion
 phones. It stays — it cost nothing and is required there. It is not the
 Infinix fix.
@@ -670,13 +755,11 @@ Remaining options for the Infinix, in the order they should be tried:
    management; Phone Master → Protected apps; lock the card in Recents. Worth
    knowing whether it stops the freeze at all, even if it can never be the
    shipped answer.
-2. **Traffic keep-alive — v1 FAILED (round 20 log), v2 BUILT (round 21,
-   Nov 5 21:34).** v1 sent 1 Hz Wi-Fi datagrams and the freezer still read
-   `speed :0` at the 5 s decision. v2 bursts 16 KiB + 16 packets per second
-   for the first 60 s, probes RX with TLS handshakes, sends DNS to every
-   resolver on the link, and logs counters (`KeepAlive: n= … txB= …`) every
-   10 s so the next round discriminates instead of guessing. Test with the
-   round-21 APK; discriminator in the retest checklist below.
+2. **Traffic keep-alive — v1 FAILED (round 20 log), v2 FAILED (round 21
+   log).** v2 moved the metric (`speed :8`, 17.5 KB/s TX / 2.8 KB/s RX,
+   `err=0`) and the freeze happened anyway at Home +5 s. Demoted to
+   observability + stock-Android niceness; not the Infinix fix. The counter
+   line (`KeepAlive: n= … txB= …`) stays as the instrument.
 3. **CDM presence observation** — the only path where the *system* wakes us
    when the friend's phone appears, surviving a frozen or even dead process.
    Unproven against `Usf_Hiber` (which proxies `p_service`), API 31+ only
@@ -729,22 +812,15 @@ Remaining options for the Infinix, in the order they should be tried:
    then for the OEM freezer:
    `Usf_Hiber.*<our-uid>` / `proxyWakeLock.*kelakonnect`.
    A freeze with **no** stop line is the round-18 bug reproducing.
-   **Round-21 discriminator:** compare `isTrafficActive uid:<our-uid> speed
-   :N` around the freeze decision against our own counter line
-   (`KeepAlive: n= sent= err= rxPkt= tlsOk= tlsFail= txB= rxB= phase= wifi=`):
-   - No freeze, counters to `phase=sustain`, probes to the end → **v2
-     worked** → walk-away range test immediately.
-   - Frozen with `speed :0` while `sent`/`txB` climb at burst rate → the
-     freezer is **not reading uid stats at all** (or wants a window longer
-     than the burst) → traffic lever dead → XOS settings pass, then CDM
-     presence observation.
-   - Frozen with `speed :0` and `txB` flat / `err` climbing / `wifi=false`
-     → our packets never left → fix the transport, not the metric.
-   - `rxPkt=0` and `tlsFail` climbing with `speed :0` → no resolver or
-     resolver-less LAN: the RX hypothesis is untested this round; judge on
-     the TX counters.
-   - Freeze **after** the first decision (screen-off pass ~2 min, or a bump
-     pass later) → burst won the first battle; raise the sustain rate.
+   **Round-22 = the XOS settings pass** (round-21 log settled the traffic
+   question: `speed :8` and a freeze anyway). Apply the four toggles from
+   the round-21 log section — Battery → Unrestricted, Auto-start management,
+   Phone Master → Protected apps, Recents lock — then repeat this checklist
+   on the same APK:
+   - No `enter FrozenState` for our uid and probes to the end → whitelist
+     model confirmed → **walk-away range test immediately** on this APK.
+   - Freeze persists despite the toggles → XOS ignores its own whitelist
+     for us → CDM presence observation is next (build).
 4. Only once (2) passes is the walk-away test worth running: no calls during
    the walk, don't open either app, walk 30 s past the point you are sure both
    are dead, capture **both** logs, and note your paces (≈0.7 m each).
