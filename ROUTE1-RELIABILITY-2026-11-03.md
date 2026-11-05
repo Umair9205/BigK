@@ -466,6 +466,103 @@ and is untouched.
 
 ---
 
+## Round 20 log (Nov 5) — the keep-alive did not move the metric
+
+`log_bigk_infinix_20.log` (3.6 MB, 02:11:34 → 02:16:20). Reinstall → new
+uid 10392, process 8112.
+
+### Timeline
+
+| Time | Event |
+|---|---|
+| 02:12:28.137 | app opened (`Start proc 8112`); `[BatteryExemption] already unrestricted` — the grant survives reinstall |
+| 02:12:30.753 | `KeepAlive: starting; 1 Hz keep-alive over Wi-Fi only` |
+| 02:12:31.764 | `KeepAlive: sending to /192.168.100.1 over Wi-Fi` (announce-once — the only send line v1 ever logs) |
+| 02:12:32.081 | **Home** (APP_SWITCH → XOSLauncher) |
+| 02:12:35.765 | watchdog probe still running post-Home ✓ |
+| 02:12:37.087 | `isTrafficActive uid:10392 speed :0` → `enter FrozenState` → **freeze, 5 s after Home** |
+| 02:12:37.097 | `kelakonnect:availability` wakelock force-released; `p_service/p_alarm/p_sensor/p_job` proxied |
+| 02:12:40.104 | `netd socketDestroy(UidRange{10392})` — all sockets killed 3 s after the freeze |
+| 02:14:32 | screen off (timeout) |
+| 02:16:04.670 | LcdOn pass re-evaluates `uid:10392 speed :0` — **no unfreeze** (weather app 10266 unfroze with `reason:LcdOn` in the same pass) |
+| 02:16:20 | capture ends; process never woke |
+
+### Verdict
+
+**Keep-alive v1 failed.** The discriminator branch `speed :0` with
+`KeepAlive` lines present fired: the freezer did not count v1's ~5–6 KiB of
+TX (RX unknown) in the 5 s it had. Same freeze shape as round 19 — 5 s after
+Home — with the exemption already granted and the keep-alive demonstrably
+running before the decision.
+
+### What the log taught
+
+1. **The metric is quantised.** Across 22 `isTrafficActive` samples of 9 uids
+   the only values ever logged are `:0` and `:1`. uid 10354 reads `:1` at both
+   LcdOn passes and is never frozen; every `:0` uid is frozen. Threshold = 1.
+2. **Three freeze triggers, all consulting `isTrafficActive`:**
+   - TOP → background **+5 s** (our freeze — screen still ON);
+   - bump/sync end **+3–14 s** (weather: `bumpService` unfreeze → frozen 3 s
+     later; `syncBinder` unfreeze → frozen 14 s later);
+   - screen-off **+~23 s** (weather: off 02:14:32 → frozen 02:14:55).
+   LcdOn never freezes — it only unfreezes — and it did not unfreeze *us*
+   (unresolved; the FGS + proxied state is the obvious difference).
+3. **Screen-on does not rescue a frozen Infinix app.** Frozen = dead until
+   the user reopens it.
+4. **No cellular activity anywhere in the capture** (zero ServiceState/rmnet/
+   SignalStrength lines) while uid 10354 still reads `:1` — the metric reads
+   Wi-Fi/total traffic, a cellular-only counter is ruled out, and the
+   keep-alive is in the right arena.
+5. Exemption re-confirmed irrelevant (`already unrestricted`, 02:12:28).
+
+### What v1 could not tell us
+
+- Whether sends continued after the first (announce-once hides them). The
+  tick chain reviews clean, but there was no evidence either way.
+- Whether the router ever answered the DNS query (RX unknown).
+- The window/unit behind `speed`: `:0` at t+5 s fits a ≥~7 s window in KB/s
+  or packets/s, *or* an RX-only counter that saw nothing.
+
+## Round 21 build (Nov 5, 21:34) — keep-alive v2: burst, RX probes, counters
+
+Answers all three unknowns in one APK. Gate: 9/9 suites PASS, `tsc --noEmit`
+exit 0, `assembleRelease` BUILD SUCCESSFUL, APK 57.6 MB (Nov 5 21:34).
+
+### What changed in `TrafficKeepAlive.kt`
+
+- **Burst phase (first 60 s):** 16 × 1 KiB pads/tick = 16 KB/s *and*
+  16 pkt/s — at the 5 s decision any window ≤ ~80 s in any plausible unit
+  already reads ≥1 — plus 5 TLS handshakes/tick.
+- **Sustain phase:** 2 pads/tick (holds ≥1 for the screen-off and bump-end
+  passes once the ramp is complete) plus 1 handshake every 2 ticks
+  (~1.3 KB/s RX in case the counter is receive-only).
+- **RX probes:** trust-all TLS handshake to 1.1.1.1/8.8.8.8 :443 — the
+  server's first flight is KBs of RX per attempt. Own executor with
+  400 ms connect / 750 ms read timeouts: a probe that times out must never
+  stall the pads; an offline LAN degrades to counted failures.
+- **DNS to every resolver:** gateway + all non-loopback LinkProperties DNS +
+  8.8.8.8/1.1.1.1 (cap 6 targets) — a reply from any of them is RX for this
+  UID; ICMP unreachable from the pad port no longer aborts the drain.
+- **Counters every 10 ticks** — the round-21 discriminator:
+
+  ```
+  KeepAlive: n= sent= err= rxPkt= tlsOk= tlsFail= txB= rxB= phase=burst|sustain wifi=true|false
+  ```
+
+  `txB/rxB` are `TrafficStats` uid totals — the same class of counter a
+  vendor metric would read. If `txB` climbs ~16 KB/s while the freezer still
+  logs `speed :0`, the freezer is not reading uid stats at all, the
+  keep-alive lever is dead, and the answer is the XOS pass → CDM.
+
+### Honest limits
+
+- Wi-Fi only; with no interface up the counter line logs `wifi=false` and
+  the freeze proceeds (walk-away case).
+- Sustain handshakes cost a few MB per backgrounded hour — fine for test
+  builds; re-price before shipping if the counter proves RX-only.
+
+---
+
 ## Decisions that shaped this stretch
 
 - **`play-services-nearby:18.7.0` has no lifecycle callbacks** — verified with
@@ -540,6 +637,13 @@ granted, and DOES NOT stop the freeze.** The dialog works end-to-end
 **Transsion's freezer ignores the standard whitelist entirely** (it froze
 WhatsApp, ChatGPT, Claude in the same window; GMS never freezes).
 
+**Status after round 20 (Nov 5): the 1 Hz traffic keep-alive (v1) does NOT
+stop the freeze either.** It demonstrably ran — `starting` 02:12:30, first
+send 02:12:31, Home 02:12:32 — and the freezer still logged
+`isTrafficActive uid:10392 speed :0` at the decision (02:12:37) and froze.
+v2 (burst volume + RX probes + logcat counters) is built; see the round-20
+log and round-21 build sections above.
+
 What the exemption is still good for: stock Android Doze on non-Transsion
 phones. It stays — it cost nothing and is required there. It is not the
 Infinix fix.
@@ -566,11 +670,13 @@ Remaining options for the Infinix, in the order they should be tried:
    management; Phone Master → Protected apps; lock the card in Recents. Worth
    knowing whether it stops the freeze at all, even if it can never be the
    shipped answer.
-2. **Traffic keep-alive — BUILT (round 20, Nov 5).** The trigger logged
-   immediately before every freeze is `isTrafficActive uid:<us> speed :0`;
-   `TrafficKeepAlive.kt` now sends 1 Hz Wi-Fi datagrams (DNS query + 1 KiB
-   pad) while the availability service runs. Test with the round-20 APK;
-   see its section above for the honest limits.
+2. **Traffic keep-alive — v1 FAILED (round 20 log), v2 BUILT (round 21,
+   Nov 5 21:34).** v1 sent 1 Hz Wi-Fi datagrams and the freezer still read
+   `speed :0` at the 5 s decision. v2 bursts 16 KiB + 16 packets per second
+   for the first 60 s, probes RX with TLS handshakes, sends DNS to every
+   resolver on the link, and logs counters (`KeepAlive: n= … txB= …`) every
+   10 s so the next round discriminates instead of guessing. Test with the
+   round-21 APK; discriminator in the retest checklist below.
 3. **CDM presence observation** — the only path where the *system* wakes us
    when the friend's phone appears, surviving a frozen or even dead process.
    Unproven against `Usf_Hiber` (which proxies `p_service`), API 31+ only
@@ -615,19 +721,30 @@ Remaining options for the Infinix, in the order they should be tried:
    after Home.** This is the whole test. Grep `[BatteryExemption]` for
    `after prompt: unrestricted=true` to confirm the grant landed, and grep
    `KeepAlive:` for `starting; 1 Hz keep-alive` + `sending to <ip> over
-   Wi-Fi` to confirm the keep-alive is running before Home.
+   Wi-Fi` (before Home) **and `KeepAlive: n= …` counter lines every 10 s
+   after it** — if the counters stop, the ticker died; if they never appear,
+   the keep-alive never started.
 3. If probes stop, grep for the new stop lines first —
    `Availability: Stopping:` / `Service destroyed; watchdog cancelled` — and
    then for the OEM freezer:
    `Usf_Hiber.*<our-uid>` / `proxyWakeLock.*kelakonnect`.
    A freeze with **no** stop line is the round-18 bug reproducing.
-   **Round-20 discriminator:** compare `isTrafficActive uid:<our-uid> speed
-   :N` around the freeze decision. `speed :0` with `KeepAlive: sending`
-   lines present means our packets are not landing on the interface the
-   freezer watches (or it wants RX-only) — tune the keep-alive from that
-   number. `speed :N` with N > 0 and no freeze means it worked; `speed :N`
-   with N > 0 and a freeze anyway means traffic is not the (only) lever →
-   fall back to the XOS settings pass, then CDM presence observation.
+   **Round-21 discriminator:** compare `isTrafficActive uid:<our-uid> speed
+   :N` around the freeze decision against our own counter line
+   (`KeepAlive: n= sent= err= rxPkt= tlsOk= tlsFail= txB= rxB= phase= wifi=`):
+   - No freeze, counters to `phase=sustain`, probes to the end → **v2
+     worked** → walk-away range test immediately.
+   - Frozen with `speed :0` while `sent`/`txB` climb at burst rate → the
+     freezer is **not reading uid stats at all** (or wants a window longer
+     than the burst) → traffic lever dead → XOS settings pass, then CDM
+     presence observation.
+   - Frozen with `speed :0` and `txB` flat / `err` climbing / `wifi=false`
+     → our packets never left → fix the transport, not the metric.
+   - `rxPkt=0` and `tlsFail` climbing with `speed :0` → no resolver or
+     resolver-less LAN: the RX hypothesis is untested this round; judge on
+     the TX counters.
+   - Freeze **after** the first decision (screen-off pass ~2 min, or a bump
+     pass later) → burst won the first battle; raise the sustain rate.
 4. Only once (2) passes is the walk-away test worth running: no calls during
    the walk, don't open either app, walk 30 s past the point you are sure both
    are dead, capture **both** logs, and note your paces (≈0.7 m each).
@@ -648,6 +765,7 @@ Availability: Stopping: PAUSE action requested | availability is paused
 Availability: Service destroyed; watchdog cancelled (paused=… wasRunning=…)
 BatteryExemption: [BatteryExemption] already unrestricted | system dialog requested | after prompt: unrestricted=…
 KeepAlive:      starting; 1 Hz keep-alive over Wi-Fi only | sending to <ip> over Wi-Fi | stopped
+KeepAlive:      n=<ticks> sent=<n> err=<n> rxPkt=<n> tlsOk=<n> tlsFail=<n> txB=<bytes> rxB=<bytes> phase=burst|sustain wifi=true|false   (every 10 s)
 DirectWifi:     owner address <mac> is a placeholder; authenticating on the session token only
 NearbyModule:   accept gate rejected endpoint=… peer=… directSession=… paused=… unsavedContact=… otherEndpointBusy=…
 ```

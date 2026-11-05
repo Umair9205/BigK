@@ -113,6 +113,21 @@ test('a 1 Hz Wi-Fi keep-alive feeds the Transsion freezer non-zero traffic',()=>
   // Loopback would never reach the radio the freezer is watching.
   assert.match(ka,/isLoopbackAddress/);
   assert.match(ka,/DatagramPacket/);
+  // Round 20 verdict: v1 sent (first send 02:12:31, Home 02:12:32) and the
+  // freezer still read `speed :0` at the decision (02:12:37). The metric only
+  // ever logs 0 or 1 for any uid — quantised, threshold 1 — and a 5 s ramp of
+  // 1 KiB/s did not reach it. v2: burst volume for the first decision, RX
+  // probes in case the counter is receive-only, and counters in logcat so the
+  // next round discriminates instead of guessing.
+  assert.match(ka,/BURST_PADS = 16/);          // 16 KiB + 16 pkt/s beats any window ≤ ~80 s at t+5s
+  assert.match(ka,/SUSTAIN_PADS = 2/);          // holds ≥1 for later passes (screen-off, bump-end)
+  assert.match(ka,/BURST_TLS = 5/);             // ~10-12 KB/s RX from resolver first-flights
+  assert.match(ka,/startHandshake/);            // TLS handshake = KBs of RX per attempt
+  assert.match(ka,/TrafficStats\.getUidTxBytes/); // uid byte totals printed for correlation
+  assert.match(ka,/phase=/);                    // counter line carries burst|sustain
+  assert.match(ka,/COUNTER_LOG_EVERY/);         // periodic counter log exists
+  assert.match(ka,/8\.8\.8\.8/);                // public resolvers invited for RX
+  assert.match(ka,/wifi=/);                     // counter line says when no interface existed
   const service=fs.readFileSync(path.join(dir,'AvailabilityService.kt'),'utf8');
   assert.match(service,/TrafficKeepAlive\.start\(this\)/);
   assert.equal((service.match(/TrafficKeepAlive\.stop\(\)/g)||[]).length,2); // PAUSE action, onDestroy
