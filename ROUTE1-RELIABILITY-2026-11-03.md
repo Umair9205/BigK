@@ -743,6 +743,10 @@ than moving to Wi-Fi for *less* range. Wi-Fi TX runs at +16 to +20 dBm, roughly
 
 ### Immediate — the blocker
 
+**Status after Nov 6 (round 23): FIXED on hardware — 1x1 overlay window plus a
+keeper VPN. Both are in the tree; details and measurements in the next
+section.**
+
 **The app does not survive being backgrounded on the Infinix.** Press Home, put
 the phone in a pocket, and it stops listening for calls. Nothing else is worth
 doing until this is fixed; a range number is useless if the phone kills the
@@ -885,18 +889,22 @@ Remaining options for the Infinix, in the order they should be tried:
    `err=0`) and the freeze happened anyway at Home +5 s. Demoted to
    observability + stock-Android niceness; not the Infinix fix. The counter
    line (`KeepAlive: n= … txB= …`) stays as the instrument.
-4. **VPN own-tunnel build** — the strongest *prevention* evidence on the
-   device (the `importantScene: VPN` finding above). Needs our own
-   `VpnService` because the carve-out is owner-only: one-time consent
-   dialog, status-bar key icon, replaces any other active VPN (the Infinix
-   currently runs WARP), Play VPN-disclosure policy, dummy route
-   (e.g. `192.0.2.0/24`) so it carries no real traffic. Build only after
-   round 22 is negative.
-5. **Overlay / chat-head bubble** — prevention via a *visible window*, a
-   different signal than FGS/BFGS (which XOS ignores); the `widget` finding
-   shows the engine does consult visible-surface state. Costs the "display
-   over other apps" consent; could ship as a genuine PTT incoming-call
-   chat-head, so it doubles as a feature. Untested.
+4. **VPN own-tunnel build — BUILT AND PASSING (Nov 6, round 23).** See the
+   round-23 section below. The strongest *prevention* evidence on the device
+   (the `importantScene: VPN` finding above) held up: with our own `VpnService`
+   tunnel up, the engine logs `importantScene: VPN: packageName=com.anonymous.
+   kelakonnect` every 30 s and `fastState: uid=10397 is pending`, with zero
+   freezes across screen-on, screen-off and the lock screen. One-time consent
+   dialog, status-bar key icon, replaces any other active VPN, dummy route
+   `192.0.2.0/24` so it carries no real traffic, Play VPN disclosure.
+5. **Overlay / chat-head bubble — BUILT, screen-on only (Nov 6, round 23).**
+   Prevention via a *visible window* works while the screen is on and unlocked
+   (`importantScene: float_window`), verified for 3+ minutes; the keyguard and
+   screen-off hide the window, so the engine's next 30 s cycle freezes. Kept in
+   the build as the screen-on layer and as the visible window that unblocks
+   background activity starts. Costs the "display over other apps" consent;
+   could ship as a genuine PTT incoming-call chat-head, so it doubles as a
+   feature.
 6. **CDM presence observation** — the only path where the *system* wakes us
    when the friend's phone appears, surviving a frozen or even dead process.
    Unproven against `Usf_Hiber` (which proxies `p_service`), API 31+ only
@@ -906,6 +914,84 @@ Remaining options for the Infinix, in the order they should be tried:
 7. ~~**Notification listener (both bets)**~~ — **DEAD, tested Nov 6:** see
    the controlled experiment above. Prevention and notification-wake both
    failed on a clean third-party subject; no build.
+
+### Round 23 builds (Nov 6) — 1x1 window + keeper VPN: the blocker is FIXED
+
+Two small builds tested the last two prevention ideas the census pointed at.
+Both mechanisms are in the tree (`KeeperActivity.kt`, `KeeperOverlay.kt`, and
+`AvailabilityService` now extends `VpnService`); the gate stayed green for each
+(9 suites + `tsc` + `assembleRelease`). BigK uid is **10397** in this round.
+
+**Build A — 1x1 overlay window (`KeeperOverlay`).** A 1x1, transparent,
+non-focusable, non-touchable `TYPE_APPLICATION_OVERLAY` window, added by the
+watchdog whenever the app is backgrounded (importance worse than `FOREGROUND`)
+and removed the moment the UI is back. It needs the "display over other apps"
+grant; note a reinstall resets that op to `default` (`cmd appops get …` showed
+`rejectTime` right after install, and the first attempt died with
+`BadTokenException: permission denied for window type 2038`), so
+`appops set … SYSTEM_ALERT_WINDOW allow` was applied for the test.
+
+- **Screen on, at Home: no freeze for 3+ minutes** (previous death: Home
+  +4–5 s). Watchdog/P2P lines kept ticking every 5 s and the engine logged
+  `importantScene: float_window: packageName=com.anonymous.kelakonnect`
+  every 30 s.
+- **Screen off / locked: still freezes.** With `KEYCODE_SLEEP` the window's
+  surface hides (`isVisible=false`), the scene disappears, and the engine's
+  next 30 s cycle froze the uid. Waking to the keyguard did not restore it
+  (`isKeyguardShowing=true`, window still `isVisible=false`). So the overlay
+  buys screen-on/unlocked time only — not the always-on case.
+- Bonus finding: a SAW grant alone does **not** permit a background activity
+  start on this build —
+  `Background activity launch blocked! … callingUidProcState: FOREGROUND_SERVICE;
+  callingUidHasNonAppVisibleWindow: false … BAL_BLOCK` (result code 102).
+  The overlay window is what satisfies `callingUidHasNonAppVisibleWindow`, so
+  it is the prerequisite for the 1x1-*activity* variant if that is ever
+  revisited. `KeeperActivity` (a translucent 1x1 activity) is kept in the tree
+  for that experiment but is not started by the current wiring.
+
+**Build B — keeper VPN (`AvailabilityService : VpnService`).** The availability
+service now also owns a dummy tunnel: `tun0`, `192.0.2.1/32`, route
+`192.0.2.0/24`, no DNS, no default route, so no real app traffic is captured.
+The tunnel comes up with the service; the watchdog retries `establish()` every
+5 s until the system consent dialog has been accepted. Consent was already
+prepared on this install, so no prompt appeared.
+
+Measured on the same install (logcat cleared at start, screen states in
+sequence):
+
+| Phase | Duration | Result |
+|---|---|---|
+| Home, screen on | 65 s | no freeze; `importantScene: float_window` + `VPN` |
+| screen off (`KEYCODE_SLEEP`) | 150 s | **no freeze**; `VPN: packageName=com.anonymous.kelakonnect` every 30 s |
+| wake to keyguard | 60 s | **no freeze** |
+
+Evidence excerpts:
+
+```
+22:08:34.558 W Usf_Hiber/fastState: uid=10397 is pending
+22:09:47.394 I Usf_Hiber/importantScene: isTrafficActive uid:10397 speed :2
+22:09:47.395 I Usf_Hiber/importantScene: uid:10397 speed :2
+22:09:47.395 I Usf_Hiber/importantScene: VPN: packageName=com.anonymous.kelakonnect
+```
+
+192 log lines from the app pid in the same window (`P2PProbe` every 5 s,
+`KeepAlive` every 10 s) and **zero `freeze uid: 10397`** events. The engine
+logs `is pending` instead of freezing; the earlier `stateManager: freeze uid`
+path never fires. System confirmation of the tunnel:
+
+```
+NetworkAgentInfo{network{570} … ni{VPN CONNECTED extra: VPN:com.anonymous.kelakonnect}
+  … InterfaceName: tun0 … OwnerUid: 10397 … sessionId=BigK background receive}
+Usf_Hiber/networkDetectorService: changedNetwork: netType=17, net=VPN
+```
+
+**Verdict.** The blocker is fixed on the Infinix: background receive now
+survives screen-on, screen-off and the lock screen. Both mechanisms stay
+(overlay = screen-on defence and BAL enabler, VPN = the exemption that survives
+sleep); either alone has a gap. Side effects to own: the VPN key icon, the
+"display over other apps" grant, a one-time consent dialog on a fresh install,
+and the usual always-on battery cost. A 15+ minute soak is running as the
+long-form confirmation; its result is appended below when it lands.
 
 ### Deferred / not built
 

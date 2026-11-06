@@ -12,6 +12,10 @@ import com.facebook.react.defaults.DefaultReactActivityDelegate
 import expo.modules.ReactActivityDelegateWrapper
 
 class MainActivity : ReactActivity() {
+  private companion object {
+    const val VPN_REQUEST = 1001
+  }
+  private var vpnPrompted = false
   override fun onNewIntent(intent: Intent) {
     super.onNewIntent(intent)
     setIntent(intent)
@@ -33,6 +37,46 @@ class MainActivity : ReactActivity() {
     setTheme(R.style.AppTheme);
     super.onCreate(null)
     updateCallWindow(intent)
+  }
+
+  override fun onStart() {
+    super.onStart()
+    // Back in the app: the keep-alive surface must never sit on top of the UI.
+    KeeperOverlay.hide(this)
+    requestVpnConsentIfNeeded()
+  }
+
+  /** One-time system consent so the availability service can own the keeper VPN
+   *  tunnel (Nov 6 freeze experiment). Declining is harmless: everything keeps
+   *  working, only the freeze exemption is missing. */
+  private fun requestVpnConsentIfNeeded() {
+    if (vpnPrompted) return
+    try {
+      val intent = android.net.VpnService.prepare(this)
+      if (intent != null) {
+        vpnPrompted = true
+        android.util.Log.i("MainActivity", "Requesting VPN consent for background receive")
+        startActivityForResult(intent, VPN_REQUEST)
+      }
+    } catch (e: Exception) {
+      android.util.Log.w("MainActivity", "VPN consent request failed", e)
+    }
+  }
+
+  override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+    super.onActivityResult(requestCode, resultCode, data)
+    if (requestCode == VPN_REQUEST) {
+      android.util.Log.i("MainActivity", "VPN consent result=$resultCode")
+      if (resultCode == RESULT_OK) startService(Intent(this, AvailabilityService::class.java))
+      vpnPrompted = false
+    }
+  }
+
+  override fun onStop() {
+    super.onStop()
+    // Leaving the app while availability is on: attach the 1x1 window so the
+    // process still owns a visible window while XOS would otherwise freeze it.
+    if (AvailabilityService.running) KeeperOverlay.show(this)
   }
 
   /**

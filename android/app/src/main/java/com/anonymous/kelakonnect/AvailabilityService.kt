@@ -3,18 +3,28 @@ package com.anonymous.kelakonnect
 import android.app.*
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.VpnService
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelFileDescriptor
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 
 /** Idle connectivity only. Never declares microphone use or claims immunity to process death. */
-class AvailabilityService : Service() {
+class AvailabilityService : VpnService() {
     companion object {
         @Volatile var running = false
             private set
         const val CHANNEL = "local_availability"
+        /** Nov 6 experiment: XOS's Usf_Hiber exempts the package that owns the
+         *  active VPN ("importantScene: VPN") in every screen state, which is
+         *  the only exemption observed to survive screen-off and the lock
+         *  screen. Nothing is actually tunnelled: a TEST-NET-2 address and
+         *  route keep all real traffic on the normal interfaces. */
+        @Volatile private var vpnFd: ParcelFileDescriptor? = null
+        @Volatile var vpnEstablished = false
+            private set
         /** Paired P2P + Nearby probes. 5s: a 20s tick brackets a walk-away
          *  death point to 20-28m of walking, which is wider than the range we
          *  are trying to measure — unusable. 5s gives 5-7m brackets. The probe
@@ -38,10 +48,12 @@ class AvailabilityService : Service() {
             DirectWifiModule.probePeerRadio(this@AvailabilityService, "watchdog")
             // Paired Nearby read so the two paths can be compared at one timestamp.
             NearbyTransport.get(this@AvailabilityService).probeNearbySnapshot("watchdog")
+            ensureKeepAliveSurface()
+            ensureTunnel()
             mainHandler.postDelayed(this, WATCHDOG_INTERVAL_MS)
         }
     }
-    override fun onBind(intent: Intent?) = null
+    override fun onBind(intent: Intent?) = super.onBind(intent)
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == "PAUSE") {
             android.util.Log.i("Availability", "Stopping: PAUSE action requested")
@@ -49,6 +61,8 @@ class AvailabilityService : Service() {
             NearbyTransport.get(this).pause()
             mainHandler.removeCallbacks(watchdog)
             TrafficKeepAlive.stop()
+            KeeperOverlay.hide(this)
+            closeTunnel()
             releaseWakeLock()
             stopSelf()
             return START_NOT_STICKY
@@ -75,6 +89,7 @@ class AvailabilityService : Service() {
             mainHandler.removeCallbacks(watchdog)
             mainHandler.postDelayed(watchdog, WATCHDOG_INTERVAL_MS)
             TrafficKeepAlive.start(this)
+            ensureTunnel()
         } catch (e: Exception) {
             running = false
             android.util.Log.e("Availability", "Foreground startup failed", e)
@@ -84,6 +99,73 @@ class AvailabilityService : Service() {
         // not just the notification. Force stop and vendor restrictions remain authoritative.
         return if (running) START_STICKY else START_NOT_STICKY
     }
+    /** Establishes the keeper tunnel, retrying every watchdog tick until the
+     *  user has approved the system VPN consent dialog. Failure is non-fatal:
+     *  the copying/text path keeps working, only the freeze protection is
+     *  missing, and the log says so once per attempt. */
+    private fun ensureTunnel() {
+        if (vpnFd != null) return
+        try {
+            if (prepare(this) != null) {
+                android.util.Log.i("Availability", "VPN keeper waiting for user consent (one-time dialog)")
+                return
+            }
+            val builder = Builder()
+                .setSession("BigK background receive")
+                .setMtu(1400)
+                .addAddress("192.0.2.1", 32)
+                .addRoute("192.0.2.0", 24)
+            val fd = builder.establish()
+            vpnFd = fd
+            vpnEstablished = fd != null
+            android.util.Log.i(
+                "Availability",
+                if (fd != null) "VPN keeper tunnel established (dummy route 192.0.2.0/24, no real traffic captured)"
+                else "VPN keeper establish() returned null"
+            )
+        } catch (e: Exception) {
+            android.util.Log.w("Availability", "VPN keeper failed", e)
+        }
+    }
+
+    private fun closeTunnel() {
+        val fd = vpnFd ?: return
+        vpnFd = null
+        vpnEstablished = false
+        try {
+            fd.close()
+            android.util.Log.i("Availability", "VPN keeper tunnel closed")
+        } catch (e: Exception) {
+            android.util.Log.w("Availability", "VPN keeper close failed", e)
+        }
+    }
+
+    override fun onRevoke() {
+        android.util.Log.i("Availability", "VPN keeper revoked by user/system")
+        vpnFd = null
+        vpnEstablished = false
+        super.onRevoke()
+    }
+
+    /** Nov 6 experiment, step 2. Every observed freeze left the uid with no
+     *  visible window, and the system itself refused the keeper activity start
+     *  while none existed ("callingUidHasNonAppVisibleWindow: false"). A window
+     *  can be added from a service at any time, so it is attached as soon as
+     *  the app is backgrounded and removed the moment the UI is back. */
+    private fun ensureKeepAliveSurface() {
+        try {
+            val info = ActivityManager.RunningAppProcessInfo()
+            ActivityManager.getMyMemoryState(info)
+            if (info.importance > ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND) {
+                KeeperOverlay.show(this)
+            } else {
+                KeeperOverlay.hide(this)
+            }
+        } catch (e: Exception) {
+            android.util.Log.w("Availability", "Keep-alive surface check failed", e)
+        }
+    }
+
     /** A phone that is asleep can still be rung, but only if the process is
      *  running when the request arrives. The accept itself is never slow — on
      *  hardware it completes in 0.04-0.07s every single time — so the loss is
@@ -123,6 +205,9 @@ class AvailabilityService : Service() {
         val paused = getSharedPreferences("availability", MODE_PRIVATE).getBoolean("paused", true)
         android.util.Log.i("Availability", "Service destroyed; watchdog cancelled (paused=$paused wasRunning=$running)")
         running = false
+        KeeperActivity.hide(this)
+        KeeperOverlay.hide(this)
+        closeTunnel()
         mainHandler.removeCallbacks(watchdog)
         TrafficKeepAlive.stop()
         releaseWakeLock()
