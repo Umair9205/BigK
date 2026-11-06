@@ -790,15 +790,88 @@ Built anyway (Nov 4, APK 10:40 PM), kept as the stock-Android path:
 - Called from the identity-ready effect in `app/_layout.tsx`, so it covers both
   first launch and phones that already completed setup.
 
+### Freeze-layer probes + controlled listener experiment (Nov 6, no build)
+
+Direct reverse-engineering of the XOS freezer over USB (Infinix, installed
+build `1.1.3-control-recovery`; BigK uid is now **10395** — reinstall changed
+it again from 10393, and it appears in the freeze list as expected).
+
+**What the engine is.** `Usf_Hiber` runs in its own process (pid 3409, tags
+`Usf_Hiber/*` + `UsfSystemServer/*`); the `hiber` service is a raw BBinder
+that refuses `dumpsys` (`FAILED_TRANSACTION`); stock AOSP `app_hibernation`
+is irrelevant (everything `hibernated=false`); settings expose `usf_*` /
+`tran_usf_*` keys but no readable whitelist, and `getAppListMode: mode=1,
+appModeList=[]` shows an empty per-app mode list. Notably the freeze engine
+**itself runs as a notification listener**
+(`com.transsion.usf/.scene.app.TranAppStateManager` in the live-listener
+list) — it classifies notifications into "important scenes".
+
+**`importantScene` census** (what it watches, logged every ~30 s): `VPN`
+(88 checks), `widget` (46), traffic/uid speed checks (291 + 62 + 5),
+`input`, `bg`.
+
+- **Round-20 mystery SOLVED:** `widget: packageName=com.rlk.weathers` →
+  `uid:10266 … transsion F to R because of LCD on, importantcase is :
+  widget`. Weather thawed on LcdOn because it has a home-screen widget; we
+  have none, so LcdOn never touched us. A widget buys a **screen-on wake
+  only** (weather still spent most of the day frozen) — not prevention.
+- **VPN is an explicit scene:** `VPN: packageName=com.cloudflare...` logs
+  every 30 s while WARP's tunnel is up. WARP (uid 10396) was frozen at
+  00:10 and 11:08 (tunnel presumably down) but **not into `FrozenState` once
+  since 19:27 while the VPN lines run** (it still appears in transient
+  `fastFreeze reason=cpuboost` lists, thawed 3 s later). The carve-out names
+  the **VPN owner package**, so only a BigK-run `VpnService` would exempt
+  *us* — somebody else's tunnel buys us nothing.
+
+**Unfreeze-reason census** (whole buffer, 1,093 freeze events): `packet` 93
+(all WhatsApp), `asyncBinderWhiteList` 16 (WhatsApp `TRANSACTION_2` = GMS
+push, Cloudflare `TRANSACTION_3`), `broadcast` 12, `wakeup` 9, `LcdOn` 5,
+`bindService` 1 (WhatsApp, `cpninfo:… # 1000` — a system_server bind thawed
+it), `bumpService` 2, `alarm` 1. At freeze, `netd: Destroyed N sockets for
+uids{…}` — so the `packet` wake class is unavailable to us (our listening
+sockets die with the freeze), and WhatsApp's 113 freezes / constant churn
+show how selective `asyncBinderWhiteList` is in practice.
+
+**Controlled listener experiment (hayloufun, Nov 6).** The earlier
+correlation — zero freezes for the five enabled notification listeners in
+1,093 events — was confounded (smartpanel/kolun run as system uid;
+atomicbrain is a priv-app on XOS's critical list, LRU `BFGS`,
+launcher-bound). Clean subject: `com.yingsheng.hayloufun`, third-party
+(`/data/app`), listener enabled, no other privilege, not running before the
+test.
+
+| Time (Nov 6) | Event |
+|---|---|
+| 20:41:01.821 | user taps it; process starts |
+| 20:41:01.9–03.1 | all four ServiceRecords created — NMS binds `MsgNotifyService` with `flags=0x5000101` (`BIND_AUTO_CREATE \| BIND_NOT_PERCEPTIBLE \| BIND_FOREGROUND_SERVICE \| BIND_ALLOW_WHITELIST_MANAGEMENT`), `ConnectionRecord … FGS`, LRU `BFGS`; listener connected during app init |
+| ~20:41:11 | user presses Home |
+| **20:41:15.957** | **`freeze uid: 10351` anyway — Home +5 s, `speed :0`, binding live for 13 s** |
+| 20:41:18.969 | `netd: Destroyed 7 sockets for uids{10351}` |
+| 20:59:02 | wake test: `cmd notification post bigk-wake-probe …` → kolun's listener received it (20:59:32) → **no thaw** |
+| 21:10 | still frozen — **0 unfreeze lines in 29 min** (control: WhatsApp froze every 5 s throughout) |
+
+**Verdict — notification-listener path DEAD, no build:**
+
+- **Bet 1 (system bind prevents freeze): FAILED.** Exactly BigK's scenario
+  (grant listener while foreground → background → freeze at +5 s): a
+  system-held, FGS-flagged, `BFGS`-state listener connection did not stop
+  `Usf_Hiber`. XOS ignores self-declared FGS (round 21) *and* system-held
+  BFGS (now).
+- **Bet 2 (notification thaws): FAILED.** The oneway
+  `INotificationListener` dispatch from system_server did not thaw a frozen
+  arbitrary uid. `asyncBinderWhiteList` is selective (WhatsApp/Cloudflare
+  class), not "any system→app oneway binder".
+
 Remaining options for the Infinix, in the order they should be tried:
 
 1. **Does an incoming Nearby connection wake the frozen callee?** (round-22
    experiment, no build — protocol in the round-21 log section above.) GMS
-   kept our discovery client registered through the freeze, and GMS async
-   binder transactions are the class that unfroze WhatsApp
-   (`reason:asyncBinderWhiteList`) — so the *existing* path may already
-   receive in background. Every freeze test so far had nobody calling; this
-   is the missing measurement, and it gates everything below.
+   kept our discovery client registered through the freeze, and
+   GMS-originated async binder transactions are **the only wake class with
+   direct positive evidence on this device** (WhatsApp thawed 16× via
+   `reason:asyncBinderWhiteList`, Cloudflare 3×). The Nov-6 probes killed
+   the notification-listener wake, so round 22 now gates *the entire
+   wake-side strategy*: every freeze test so far had nobody calling.
 2. **XOS one-time setup pass — ALREADY APPLIED before round 21 →
    provisionally NEGATIVE.** All four toggles (Battery → Unrestricted,
    Auto-start management, Phone Master → Protected apps, Recents lock) were
@@ -812,12 +885,27 @@ Remaining options for the Infinix, in the order they should be tried:
    `err=0`) and the freeze happened anyway at Home +5 s. Demoted to
    observability + stock-Android niceness; not the Infinix fix. The counter
    line (`KeepAlive: n= … txB= …`) stays as the instrument.
-4. **CDM presence observation** — the only path where the *system* wakes us
+4. **VPN own-tunnel build** — the strongest *prevention* evidence on the
+   device (the `importantScene: VPN` finding above). Needs our own
+   `VpnService` because the carve-out is owner-only: one-time consent
+   dialog, status-bar key icon, replaces any other active VPN (the Infinix
+   currently runs WARP), Play VPN-disclosure policy, dummy route
+   (e.g. `192.0.2.0/24`) so it carries no real traffic. Build only after
+   round 22 is negative.
+5. **Overlay / chat-head bubble** — prevention via a *visible window*, a
+   different signal than FGS/BFGS (which XOS ignores); the `widget` finding
+   shows the engine does consult visible-surface state. Costs the "display
+   over other apps" consent; could ship as a genuine PTT incoming-call
+   chat-head, so it doubles as a feature. Untested.
+6. **CDM presence observation** — the only path where the *system* wakes us
    when the friend's phone appears, surviving a frozen or even dead process.
    Unproven against `Usf_Hiber` (which proxies `p_service`), API 31+ only
    (Infinix ✅, Samsung ✗ but doesn't freeze anyway), costs one consent dialog
-   during QR pairing. Reserve decision already on file; next if the round-22
-   experiment is negative.
+   during QR pairing. Wake-side reserve — the alternative to prevention
+   (4/5) if round 22 is negative.
+7. ~~**Notification listener (both bets)**~~ — **DEAD, tested Nov 6:** see
+   the controlled experiment above. Prevention and notification-wake both
+   failed on a clean third-party subject; no build.
 
 ### Deferred / not built
 
@@ -874,7 +962,11 @@ Remaining options for the Infinix, in the order they should be tried:
    `NearbyProbe:`, `enter FrozenState`.
    - Unfreeze + ring → background receive works → **walk-away range test**
      (callee auto-answer build next so it can pick up unattended).
-   - Silence while GMS saw the caller → CDM presence observation build.
+   - Silence while GMS saw the caller → GMS delivery doesn't wake us →
+     prevention build next (VPN own-tunnel, evidence-first; overlay bubble
+     as the feature-shaped alternative), CDM presence observation as the
+     wake-side reserve. The notification-listener path is dead (Nov-6
+     experiment above).
    - GMS never saw the caller → advertising/discovery died with the freeze —
      fix that first.
 4. Only once (2) passes is the walk-away test worth running: no calls during
