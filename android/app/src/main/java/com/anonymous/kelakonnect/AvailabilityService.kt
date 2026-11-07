@@ -6,7 +6,6 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
-import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 
 /** Idle connectivity only. Never declares microphone use or claims immunity to process death. */
@@ -25,7 +24,12 @@ class AvailabilityService : Service() {
         private const val WATCHDOG_INTERVAL_MS = 5_000L
     }
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var wakeLock: PowerManager.WakeLock? = null
+    // No partial wakelock (round 25). The VPN exemption is the freeze fix; the
+    // CPU is allowed to sleep between packets. The old permanent
+    // PARTIAL_WAKE_LOCK was only a workaround for the pre-VPN freezes and cost
+    // battery for the whole session. If a screen-off call cannot wake the
+    // process, the fix is packet-driven (Wi-Fi Direct / Nearby), not a
+    // permanent lock.
     // Foreground-service stickiness covers process death only. A stuck call session
     // or a silently dropped advertisement must also self-heal without React Native.
     private val watchdog = object : Runnable {
@@ -55,28 +59,31 @@ class AvailabilityService : Service() {
             TrafficKeepAlive.stop()
             KeeperOverlay.hide(this)
             KeeperVpnService.stop(this)
-            releaseWakeLock()
             stopSelf()
             return START_NOT_STICKY
+        }
+        if (intent?.action == "TOGGLE_VPN") {
+            val enable = !KeeperVpnService.isEnabled(this)
+            android.util.Log.i("Availability", "VPN protection toggle requested: ${if (enable) "on" else "off"}")
+            KeeperVpnService.setEnabled(this, enable)
+            // The notification is the only surface that can flip the switch while
+            // the app is backgrounded. Rebuild it in place so the action label
+            // follows the new state. If the service was not actually running,
+            // fall through to a normal start.
+            if (running) {
+                try { showNotification() } catch (e: Exception) {
+                    android.util.Log.w("Availability", "VPN toggle notification refresh failed", e)
+                }
+                return START_STICKY
+            }
         }
         if (getSharedPreferences("availability", MODE_PRIVATE).getBoolean("paused", true)) {
             android.util.Log.i("Availability", "Stopping: availability is paused")
             stopSelf(); return START_NOT_STICKY
         }
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.createNotificationChannel(NotificationChannel(CHANNEL, "Local calling availability", NotificationManager.IMPORTANCE_LOW))
-        val open = PendingIntent.getActivity(this, 300, Intent(this, MainActivity::class.java), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        val pause = PendingIntent.getService(this, 301, Intent(this, AvailabilityService::class.java).setAction("PAUSE"), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        val notification = NotificationCompat.Builder(this, CHANNEL)
-            .setSmallIcon(android.R.drawable.sym_action_call).setContentTitle("BigK local calling enabled")
-            .setContentText("Listening for nearby calls · Tap to open")
-            .setContentIntent(open).setOngoing(true).setOnlyAlertOnce(true)
-            .addAction(0, "Pause availability", pause).build()
         try {
-            if (Build.VERSION.SDK_INT >= 29) startForeground(43, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
-            else startForeground(43, notification)
+            showNotification()
             running = true
-            holdWakeLock()
             NearbyTransport.get(this).restore()
             mainHandler.removeCallbacks(watchdog)
             mainHandler.postDelayed(watchdog, WATCHDOG_INTERVAL_MS)
@@ -91,6 +98,37 @@ class AvailabilityService : Service() {
         // not just the notification. Force stop and vendor restrictions remain authoritative.
         return if (running) START_STICKY else START_NOT_STICKY
     }
+    /** The availability notification carries both controls: pause everything,
+     *  or release only the VPN slot (banking apps and another VPN need it).
+     *  Rebuilt after a toggle so the action label follows the state. */
+    private fun buildNotification(): Notification {
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(NotificationChannel(CHANNEL, "Local calling availability", NotificationManager.IMPORTANCE_LOW))
+        val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        val open = PendingIntent.getActivity(this, 300, Intent(this, MainActivity::class.java), flags)
+        val pause = PendingIntent.getService(this, 301, Intent(this, AvailabilityService::class.java).setAction("PAUSE"), flags)
+        val vpn = PendingIntent.getService(this, 302, Intent(this, AvailabilityService::class.java).setAction("TOGGLE_VPN"), flags)
+        val vpnOn = KeeperVpnService.isEnabled(this)
+        val vpnState = when {
+            !vpnOn -> "VPN off"
+            KeeperVpnService.established -> "VPN on"
+            else -> "VPN starting"
+        }
+        return NotificationCompat.Builder(this, CHANNEL)
+            .setSmallIcon(android.R.drawable.sym_action_call).setContentTitle("BigK local calling enabled")
+            .setContentText("Listening for nearby calls · $vpnState")
+            .setContentIntent(open).setOngoing(true).setOnlyAlertOnce(true)
+            .addAction(0, "Pause availability", pause)
+            .addAction(0, if (vpnOn) "Turn off VPN" else "Turn on VPN", vpn)
+            .build()
+    }
+
+    private fun showNotification() {
+        val notification = buildNotification()
+        if (Build.VERSION.SDK_INT >= 29) startForeground(43, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+        else startForeground(43, notification)
+    }
+
     /** Nov 6 experiment, step 2. Every observed freeze left the uid with no
      *  visible window, and the system itself refused the keeper activity start
      *  while none existed ("callingUidHasNonAppVisibleWindow: false"). A window
@@ -110,33 +148,6 @@ class AvailabilityService : Service() {
         }
     }
 
-    /** A phone that is asleep can still be rung, but only if the process is
-     *  running when the request arrives. The accept itself is never slow — on
-     *  hardware it completes in 0.04-0.07s every single time — so the loss is
-     *  entirely in delivery, and a screen-off callee is the one failure mode
-     *  with no protection at all. Partial keeps the CPU up and leaves the
-     *  display alone. */
-    private fun holdWakeLock() {
-        try {
-            // onStartCommand runs repeatedly (START_STICKY restarts, repeated
-            // starts) and each call used to allocate a fresh WakeLock over the
-            // old reference without releasing it — the orphaned objects were
-            // then finalized while still held (7 holds, 7 finalizations in one
-            // session). Non-refcounted with a fixed tag, so an already-held
-            // lock needs nothing further; only a null or system-reclaimed
-            // reference is worth a new allocation.
-            if (wakeLock?.isHeld == true) return
-            val power = getSystemService(PowerManager::class.java)
-            wakeLock = power?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "kelakonnect:availability")
-            wakeLock?.setReferenceCounted(false)
-            wakeLock?.acquire()
-            android.util.Log.i("Availability", "Holding partial wakelock; screen stays off")
-        } catch (e: Exception) { android.util.Log.w("Availability", "Wakelock unavailable", e) }
-    }
-    private fun releaseWakeLock() {
-        try { if (wakeLock?.isHeld == true) wakeLock?.release() } catch (_: Exception) {}
-        wakeLock = null
-    }
     override fun onTaskRemoved(rootIntent: Intent?) {
         android.util.Log.i("Availability", "Recent task removed; native listener remains enabled")
         NearbyTransport.get(this).restore()
@@ -153,7 +164,6 @@ class AvailabilityService : Service() {
         KeeperVpnService.stop(this)
         mainHandler.removeCallbacks(watchdog)
         TrafficKeepAlive.stop()
-        releaseWakeLock()
         stopForeground(STOP_FOREGROUND_REMOVE)
         super.onDestroy()
     }

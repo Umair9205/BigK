@@ -2,7 +2,10 @@ param(
     [string]$AndroidSdk = 'C:\Users\umair\AppData\Local\Android\Sdk',
     [string]$JavaPath = 'C:\Program Files\Java\jdk-17'
 )
-$ErrorActionPreference = 'Stop'
+# Native tools (node, gradle) write diagnostics to stderr even on success; those
+# must not become terminating errors, because every command below is already
+# guarded by an explicit `$LASTEXITCODE` check.
+$ErrorActionPreference = 'Continue'
 $projectPath = Split-Path -Parent $PSScriptRoot
 $env:JAVA_HOME = $JavaPath
 $env:ANDROID_HOME = $AndroidSdk

@@ -51,6 +51,12 @@ class MainActivity : ReactActivity() {
    *  working, only the freeze exemption is missing. */
   private fun requestVpnConsentIfNeeded() {
     if (vpnPrompted) return
+    // The user can release the VPN slot for a banking app or another VPN.
+    // Never re-prompt behind their back.
+    if (!KeeperVpnService.isEnabled(this)) {
+      android.util.Log.i("MainActivity", "VPN protection is off; consent not requested")
+      return
+    }
     // One VPN owner at a time: never fight (or interrupt) another VPN such as
     // Cloudflare WARP. The keeper stays idle until that VPN disconnects.
     if (KeeperVpnService.anotherVpnActive(this)) {

@@ -54,7 +54,34 @@ class CallForegroundServiceModule(private val reactContext: ReactApplicationCont
             putBoolean("notifications", NotificationManagerCompat.from(reactContext).areNotificationsEnabled())
             putBoolean("scanning", NearbyTransport.get(reactContext).isDiscovering)
             putBoolean("advertising", NearbyTransport.get(reactContext).isAdvertising)
+            val vpn = vpnStatusMap()
+            putBoolean("vpnEnabled", vpn.getBoolean("enabled"))
+            putBoolean("vpnActive", vpn.getBoolean("active"))
+            putBoolean("otherVpn", vpn.getBoolean("otherVpn"))
         })
+    }
+
+    @ReactMethod fun vpnStatus(promise: Promise) {
+        promise.resolve(vpnStatusMap())
+    }
+
+    /** Release or reclaim the VPN slot without changing call availability.
+     *  Off is the escape hatch for banking apps and a user's own VPN. */
+    @ReactMethod fun setVpnEnabled(enabled: Boolean, promise: Promise) {
+        try {
+            KeeperVpnService.setEnabled(reactContext, enabled)
+            promise.resolve(vpnStatusMap())
+        } catch (e: Exception) {
+            promise.reject("VPN_TOGGLE", "Could not change VPN protection", e)
+        }
+    }
+
+    private fun vpnStatusMap(): WritableMap = Arguments.createMap().apply {
+        val enabled = KeeperVpnService.isEnabled(reactContext)
+        putBoolean("enabled", enabled)
+        // Teardown is asynchronous; report the user's intent immediately.
+        putBoolean("active", enabled && KeeperVpnService.established)
+        putBoolean("otherVpn", KeeperVpnService.anotherVpnActive(reactContext))
     }
     @ReactMethod fun showIncoming(id: String, name: String, audible: Boolean, promise: Promise) {
         try { IncomingCallNotification.show(reactContext, id, name, audible); promise.resolve(true) }

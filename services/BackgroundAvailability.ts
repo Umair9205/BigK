@@ -13,19 +13,40 @@ export function requireCallNotifications(method: string) {
   }
   return callNotifications;
 }
-export const useAvailability = create<{status: string; enabled: boolean; busy: boolean}>(() => ({
+type AvailabilityState = {
+  status: string; enabled: boolean; busy: boolean;
+  vpnEnabled: boolean; vpnActive: boolean; otherVpn: boolean;
+};
+export const useAvailability = create<AvailabilityState>(() => ({
   status: 'Starting local calling…', enabled: false, busy: false,
+  vpnEnabled: true, vpnActive: false, otherVpn: false,
 }));
 let pending: Promise<void> | null = null;
 let wanted = false;
 let generation = 0;
+
+/** Mirror the native VPN fields so the settings switch stays honest. */
+function vpnFields(status: any) {
+  return {
+    vpnEnabled: status?.vpnEnabled !== false,
+    vpnActive: !!status?.vpnActive,
+    otherVpn: !!status?.otherVpn,
+  };
+}
+function availabilityLine(status: any): string {
+  if (!status?.notifications) return 'Notifications blocked · background calls may not alert you';
+  if (status?.vpnEnabled === false) return 'Local calling enabled · VPN off (screen-off protection reduced)';
+  if (status?.otherVpn) return 'Local calling enabled · waiting for the other VPN';
+  if (!status?.vpnActive) return 'Local calling enabled · VPN starting';
+  return 'Local calling enabled · reachability checked when you call';
+}
 
 /** The one place that reflects a native pause into JS state. */
 function markPaused() {
   wanted = false; generation++;
   void discovery.stopDiscovery();
   void useAppStore.getState().updateSettings({ scanningEnabled: false });
-  useAvailability.setState({ enabled: false, status: 'Unavailable · local calling paused' });
+  useAvailability.setState({ enabled: false, vpnActive: false, status: 'Unavailable · local calling paused' });
 }
 
 export async function pauseAvailability() {
@@ -38,9 +59,24 @@ export async function pauseAvailability() {
     await discovery.stopDiscovery();
     await Nearby.stopAdvertising();
     await requireCallNotifications('stopAvailability').stopAvailability();
-    useAvailability.setState({ enabled: false, status: 'Unavailable · local calling paused' });
+    useAvailability.setState({ enabled: false, vpnActive: false, status: 'Unavailable · local calling paused' });
   } catch (error: any) {
     useAvailability.setState({ enabled: false, status: error?.message || 'Could not pause local calling. Reopen BigK and retry.' });
+  } finally { useAvailability.setState({ busy: false }); }
+}
+
+export async function setVpnEnabled(enabled: boolean) {
+  const before = useAvailability.getState().vpnEnabled;
+  useAvailability.setState({ busy: true, vpnEnabled: enabled });
+  try {
+    await requireCallNotifications('setVpnEnabled').setVpnEnabled(enabled);
+    const runtime = await requireCallNotifications('availabilityStatus').availabilityStatus();
+    useAvailability.setState({
+      ...vpnFields(runtime),
+      status: runtime?.running ? availabilityLine(runtime) : useAvailability.getState().status,
+    });
+  } catch (error: any) {
+    useAvailability.setState({ vpnEnabled: before, status: error?.message || 'Could not change VPN protection.' });
   } finally { useAvailability.setState({ busy: false }); }
 }
 
@@ -68,9 +104,7 @@ export function resumeAvailability(request = true, explicitResume = false): Prom
       const status = await callNotifications.availabilityStatus();
       if (!wanted || ticket !== generation) return;
       if (!status.running) throw new Error('Background availability stopped. Reopen the app to retry.');
-      useAvailability.setState({ enabled: true, status: status.notifications
-        ? 'Local calling enabled · reachability checked when you call'
-        : 'Notifications blocked · background calls may not alert you' });
+      useAvailability.setState({ enabled: true, ...vpnFields(status), status: availabilityLine(status) });
       if (request) await useAppStore.getState().updateSettings({ scanningEnabled: true });
     } catch (error: any) {
       useAvailability.setState({ enabled: false, status: error?.message || 'Local calling unavailable' });
@@ -97,7 +131,11 @@ export async function availabilityHealthCheck(): Promise<boolean> {
     if (!wanted || calls.getState() !== 'idle') return true;
     if (status.paused) { markPaused(); return true; }
     // `scanning` is absent on older APKs (undefined), never treated as broken.
-    if (status.running && status.scanning !== false) return true;
+    if (status.running && status.scanning !== false) {
+      // Keep the VPN switch in sync with the notification action.
+      useAvailability.setState({ ...vpnFields(status), status: availabilityLine(status) });
+      return true;
+    }
     console.warn('[Availability] Health check failed; recovering', JSON.stringify(status));
     await resumeAvailability(false);
     return false;

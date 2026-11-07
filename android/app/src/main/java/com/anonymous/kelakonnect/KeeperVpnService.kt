@@ -64,6 +64,31 @@ class KeeperVpnService : VpnService() {
          *  reconnect cannot immediately kick the new owner back. */
         private const val REVOKE_COOLDOWN_MS = 30_000L
 
+        private const val PREFS = "keeper"
+        private const val PREF_VPN_ENABLED = "vpn_enabled"
+
+        /** User-facing switch. Off means "release the VPN slot now": banking
+         *  apps and another VPN can run, at the cost of the freezer exemption.
+         *  The preference is deliberately separate from availability so the
+         *  call service can keep running with the tunnel down. */
+        fun isEnabled(context: Context): Boolean =
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getBoolean(PREF_VPN_ENABLED, true)
+
+        fun setEnabled(context: Context, enabled: Boolean) {
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit().putBoolean(PREF_VPN_ENABLED, enabled).apply()
+            if (enabled) {
+                android.util.Log.i("KeeperVpn", "VPN protection enabled by user")
+                lastRevokeMs = 0L
+                lastOtherVpn = null
+                sync(context)
+            } else {
+                android.util.Log.i("KeeperVpn", "VPN protection disabled by user")
+                stop(context)
+            }
+        }
+
         /** True when a VPN we do not own is connected. */
         fun anotherVpnActive(context: Context): Boolean {
             if (fd != null) return false // the active VPN is ours
@@ -80,6 +105,7 @@ class KeeperVpnService : VpnService() {
 
         /** Called from the availability watchdog every 5 s. */
         fun sync(context: Context) {
+            if (!isEnabled(context)) return
             if (android.os.SystemClock.elapsedRealtime() - lastRevokeMs < REVOKE_COOLDOWN_MS) return
             if (anotherVpnActive(context)) {
                 if (lastOtherVpn != true) {
@@ -135,9 +161,15 @@ class KeeperVpnService : VpnService() {
         }
 
         fun stop(context: Context) {
-            try {
-                context.stopService(Intent(context, KeeperVpnService::class.java))
-            } catch (_: Exception) {
+            // A VpnService is not reliably torn down by stopService() while its
+            // tunnel is active. Close the fd from inside the service: that is
+            // what actually releases the VPN interface, and only then stopSelf.
+            val service = instance
+            if (service != null) {
+                try { service.closeTunnel() } catch (_: Exception) {}
+                try { service.stopSelf() } catch (_: Exception) {}
+            } else {
+                try { context.stopService(Intent(context, KeeperVpnService::class.java)) } catch (_: Exception) {}
             }
         }
     }
@@ -148,6 +180,11 @@ class KeeperVpnService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (!isEnabled(this)) {
+            android.util.Log.i("KeeperVpn", "VPN protection is off; not establishing")
+            stopSelf()
+            return START_NOT_STICKY
+        }
         if (fd != null) return START_STICKY
         if (android.os.SystemClock.elapsedRealtime() - lastRevokeMs < REVOKE_COOLDOWN_MS) return START_NOT_STICKY
         if (anotherVpnActive(this)) {
@@ -184,18 +221,20 @@ class KeeperVpnService : VpnService() {
     override fun onRevoke() {
         android.util.Log.i("KeeperVpn", "Tunnel revoked by the system or another VPN")
         lastRevokeMs = android.os.SystemClock.elapsedRealtime()
-        close()
+        closeTunnel()
         super.onRevoke()
     }
 
     override fun onDestroy() {
         android.util.Log.i("KeeperVpn", "Service destroyed (established=$established)")
-        close()
+        closeTunnel()
         if (instance === this) instance = null
         super.onDestroy()
     }
 
-    private fun close() {
+    /** Releases the tunnel and the VPN interface. Public so the companion can
+     *  tear the tunnel down on a user toggle without waiting for onDestroy. */
+    fun closeTunnel() {
         relay?.stop(hard = true)
         relay = null
         val current = fd ?: return
