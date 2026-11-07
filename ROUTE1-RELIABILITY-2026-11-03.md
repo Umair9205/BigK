@@ -1060,6 +1060,63 @@ WebRTC media path and remains direct. The VPN is still single-slot: it defers
 to WARP, and in that state the relay is unavailable (the call falls back to
 the direct path, but the freezer exemption is WARP's, not ours).
 
+### Round 25 build (Nov 8) - VPN protection toggle + no permanent wakelock
+
+**What shipped.**
+
+- **Wakelock removed.** `AvailabilityService` no longer holds `PARTIAL_WAKE_LOCK`;
+  the VPN exemption is the freeze fix and the CPU is allowed to sleep between
+  packets. The old tag `kelakonnect:availability` should no longer appear in
+  `dumpsys power`. `TrafficKeepAlive` still feeds `isTrafficActive` while the
+  CPU is awake.
+- **VPN protection toggle.** A user-facing switch (Settings row `VPN protection`
+  plus a `Turn off VPN` / `Turn on VPN` action on the availability
+  notification) releases *only* the VPN slot. Call availability, the overlay and
+  the foreground service keep running. Use it before opening a banking app or
+  another VPN (e.g. Cloudflare WARP). When off, the freezer exemption is gone
+  and the app may freeze in the background - that is the accepted trade-off.
+- **Persistence.** The choice lives in `keeper` prefs (`vpn_enabled`, default
+  true). `KeeperVpnService.sync()` and `onStartCommand` honor it, so a toggle
+  off survives the 5 s watchdog and process restarts. `MainActivity` no longer
+  requests VPN consent while it is off.
+- **Teardown.** `stop()` now closes the tunnel fd directly via `closeTunnel()`
+  before `stopSelf()`; `stopService()` alone did not release the interface on
+  this hardware.
+- **JS state.** `useAvailability` carries `vpnEnabled`/`vpnActive`/`otherVpn`;
+  `availabilityStatus` and a new `setVpnEnabled` native method feed them, and
+  the 60 s health check refreshes them so a notification-action toggle shows up
+  when the app returns to the foreground.
+- **Build gate.** `scripts/build-offline-call.ps1` no longer treats native
+  stderr as a terminating error (every command is already guarded by
+  `$LASTEXITCODE`); the gate now runs to completion. Green: 9 Node suites +
+  `tsc` + `assembleRelease`, APK SHA-256
+  `B559A47ED3DF41C9D8A925FA6603A5FAF8333BEA9D5093E9F9644BE8BB606B8D`.
+
+**On-device results (Nov 8).**
+
+- **No-wakelock soak.** 16.5 min screen-off (`mWakefulness=Dozing`), `main,system`
+  buffer, 40,407 lines (01:48-02:04): **0 real `freeze uid: 10399`**,
+  **72 `importantScene: VPN: packageName=com.anonymous.kelakonnect`** lines, and
+  `P2PProbe` ticks through 02:04:40. `dumpsys power` shows no new
+  `kelakonnect:availability` ACQ line (last one is 00:48, from the old build).
+  The VPN exemption alone keeps the app alive with the CPU allowed to sleep.
+- **VPN toggle.** Off: `tun0` gone within ~1 s, `VPN protection disabled by
+  user`, service destroyed. On: `VPN protection enabled by user`, tunnel
+  re-established. The choice persisted across the APK reinstall.
+- **WARP coexistence.** WARP connected: BigK logged `Tunnel revoked by the
+  system or another VPN` then `Another VPN owns the tunnel; keeper idle (will
+  not override)`; `tun0` stayed WARP's (172.16.0.2); BigK never stole the slot.
+  WARP disconnected (`Until I turn it back on`): BigK logged `No other VPN
+  active; keeper tunnel may start` and re-established within ~30 s.
+
+**Log vocabulary (round 25).**
+
+```
+KeeperVpn:  VPN protection enabled/disabled by user
+KeeperVpn:  VPN protection is off; not establishing
+Availability: VPN toggle requested: on|off
+```
+
 ### Deferred / not built
 
 - ~~**P0 owner-address guard / accept-gate logging**~~ — **both built in
