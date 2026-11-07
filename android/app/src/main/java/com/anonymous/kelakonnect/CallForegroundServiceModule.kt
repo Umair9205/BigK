@@ -189,11 +189,25 @@ class CallForegroundServiceModule(private val reactContext: ReactApplicationCont
     @ReactMethod
     fun stopCallService(promise: Promise) {
         try {
-            UiThreadUtil.runOnUiThread {
-                if (Build.VERSION.SDK_INT >= 27) {
-                    currentActivity?.setShowWhenLocked(false)
-                    currentActivity?.setTurnScreenOn(false)
+            // Apply the window flags on the UI thread and wait until they have
+            // been applied before resolving. JS navigates away (router.back())
+            // once this promise resolves; without the wait,
+            // setShowWhenLocked(false) has not run yet and the home screen can
+            // flash over the lockscreen after a call ends while the phone is
+            // locked.
+            val latch = java.util.concurrent.CountDownLatch(1)
+            Handler(Looper.getMainLooper()).post {
+                try {
+                    if (Build.VERSION.SDK_INT >= 27) {
+                        currentActivity?.setShowWhenLocked(false)
+                        currentActivity?.setTurnScreenOn(false)
+                    }
+                } finally {
+                    latch.countDown()
                 }
+            }
+            if (!latch.await(2, java.util.concurrent.TimeUnit.SECONDS)) {
+                android.util.Log.w(TAG, "stopCallService: UI thread did not apply window flags in time")
             }
             val intent = Intent(reactContext, CallForegroundService::class.java)
 

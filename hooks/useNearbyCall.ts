@@ -28,13 +28,16 @@ export function useNearbyCall(role: 'caller' | 'callee', peer: string, name: str
   const unmountTimer = useRef<ReturnType<typeof setTimeout>>();
   const subscriptions = useRef<{ remove(): void }[]>([]);
 
-  const cleanup = useCallback((outcome: Outcome, navigate = true) => {
+  const cleanup = useCallback(async (outcome: Outcome, navigate = true) => {
     const c = control.current;
     if (c.ended) return;
     c.ended = true;
     if (navigate) { setState('ended'); setStatus('Closing connection…'); }
     callNotifications.dismissIncoming(id);
-    void callNotifications.stopCallService().catch(() => {});
+    // Await the native teardown so setShowWhenLocked(false) has been applied
+    // before we navigate away. Without this, router.back() can show the home
+    // screen over the lockscreen after a call ends while the phone is locked.
+    await callNotifications.stopCallService().catch(() => {});
     clearInterval(c.timer); clearTimeout(c.timeout); Vibration.cancel();
     subscriptions.current.forEach(s => s.remove()); subscriptions.current = [];
     const stopped = audio.stopStreaming();

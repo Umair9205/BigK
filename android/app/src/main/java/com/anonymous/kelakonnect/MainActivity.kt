@@ -44,6 +44,19 @@ class MainActivity : ReactActivity() {
     // Back in the app: the keep-alive surface must never sit on top of the UI.
     KeeperOverlay.hide(this)
     requestVpnConsentIfNeeded()
+    // Safety net: showWhenLocked is only legitimate while an incoming-call
+    // window is being shown (launched via the notification intent). Clear it
+    // on every resume so a call that ended while the app was backgrounded
+    // cannot leave the home screen showing over the lockscreen. During an
+    // active call onStart() does not fire (the activity stays started), so the
+    // call screen keeps showing on the lockscreen as intended.
+    val showWhenLocked = intent?.getStringExtra("localCallSession")?.let {
+        IncomingCallNotification.permits(it, intent.getStringExtra("localCallToken"))
+    } == true
+    if (!showWhenLocked) {
+        setShowWhenLocked(false)
+        setTurnScreenOn(false)
+    }
   }
 
   /** One-time system consent so the availability service can own the keeper VPN
