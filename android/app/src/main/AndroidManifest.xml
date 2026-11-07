@@ -79,31 +79,27 @@
       </intent-filter>
     </activity>
 
-    <!-- 1x1 keep-alive surface: translucent, own task, never in recents.
-         Experimental (Nov 6) — delete with KeeperActivity.kt to revert. -->
-    <activity
-        android:name=".KeeperActivity"
-        android:exported="false"
-        android:excludeFromRecents="true"
-        android:taskAffinity="com.kelakonnect.keeper"
-        android:launchMode="singleInstance"
-        android:configChanges="keyboard|keyboardHidden|orientation|screenSize|screenLayout|uiMode"
-        android:theme="@android:style/Theme.Translucent.NoTitleBar" />
-
-    <!-- Availability service. Nov 6: also owns the keeper VPN tunnel so XOS's
-         freezer treats the uid as an active VPN (the only exemption that
-         survives screen-off and the lock screen). BIND_VPN_SERVICE keeps the
-         exported binding system-only. -->
+    <!-- Idle availability: FGS + watchdog + overlay. Not a VpnService: the
+         system destroys a VpnService when its tunnel is revoked, and this
+         service must survive another VPN taking over. -->
     <service
         android:name=".AvailabilityService"
         android:foregroundServiceType="connectedDevice"
+        android:exported="false"
+        android:stopWithTask="false"/>
+
+    <!-- Keeper tunnel (Nov 6). Defers to any other active VPN; since round 24
+         it owns 10.111.222.0/24 as a real local call relay instead of a dummy
+         TEST-NET-2 route. -->
+    <service
+        android:name=".KeeperVpnService"
         android:exported="true"
-        android:permission="android.permission.BIND_VPN_SERVICE"
-        android:stopWithTask="false">
+        android:permission="android.permission.BIND_VPN_SERVICE">
       <intent-filter>
         <action android:name="android.net.VpnService"/>
       </intent-filter>
     </service>
+
     <service
         android:name=".CallForegroundService"
         android:foregroundServiceType="microphone"

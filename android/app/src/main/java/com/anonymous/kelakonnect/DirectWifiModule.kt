@@ -612,11 +612,22 @@ class DirectWifiModule(private val context: ReactApplicationContext) : ReactCont
             try {
                 // Settle only at control-ready (like the client). A deadline
                 // miss now rejects the same promise JS already awaits.
-                val connection = DirectControlSocket.accept(local, 9875, "${r.id}|${r.token}",
+                //
+                // When the keeper tunnel is ours the host listens on the
+                // virtual peer instead of the P2P address; KeeperVpnService
+                // accepts on the real address and bridges to this listener.
+                // Any failure falls back to the direct path unchanged.
+                val localIp = local.hostAddress
+                if (localIp == null) { fail(r, "Direct control host: local P2P address unavailable"); return@execute }
+                val relayed = KeeperVpnService.configureRelay(false, localIp, localIp)
+                val bind = if (relayed) InetAddress.getByName(KeeperVpnService.VIRTUAL_PEER) else local
+                val port = if (relayed) KeeperVpnService.APP_PORT else KeeperVpnService.PEER_PORT
+                if (relayed) Log.i("DirectWifi", "session=${r.id} control host via keeper relay (app $bind:$port, peer $localIp:${KeeperVpnService.PEER_PORT})")
+                val connection = DirectControlSocket.accept(bind, port, "${r.id}|${r.token}",
                     DirectControlSocket.now() + 25000, { current(r) }, { r.server = it }, { r.socket = it }, { stage(r, it) })
                 // Outside the accept/authentication retry block: a failure here
                 // must never be masked by a second accept on a closed listener.
-                ready(r, connection.socket, connection.writer, connection.reader)
+                ready(r, connection.socket, connection.writer, connection.reader, localIp)
             } catch (e: Exception) { if (current(r)) fail(r, "Direct control host (${r.phase}): ${e.message}") }
         }
     }
@@ -624,20 +635,34 @@ class DirectWifiModule(private val context: ReactApplicationContext) : ReactCont
         io.execute {
             try {
                 stage(r, "connecting-control")
-                val connection = DirectControlSocket.connect(local, InetAddress.getByName(ip), 9875, "${r.id}|${r.token}",
+                // Client dials the virtual peer; the keeper relay dials the
+                // real group owner with a protect()ed socket. The reported
+                // local IP stays the real P2P address because DirectCallAudio
+                // filters WebRTC host candidates against it.
+                val localIp = local.hostAddress
+                if (localIp == null) { fail(r, "Direct control client: local P2P address unavailable"); return@execute }
+                val relayed = KeeperVpnService.configureRelay(true, localIp, ip)
+                val bind = if (relayed) InetAddress.getByName(KeeperVpnService.VIRTUAL_LOCAL) else local
+                val target = if (relayed) InetAddress.getByName(KeeperVpnService.VIRTUAL_PEER) else InetAddress.getByName(ip)
+                val port = if (relayed) KeeperVpnService.APP_PORT else KeeperVpnService.PEER_PORT
+                if (relayed) Log.i("DirectWifi", "session=${r.id} control client via keeper relay (app $bind -> $target:$port, peer $ip:${KeeperVpnService.PEER_PORT})")
+                val connection = DirectControlSocket.connect(bind, target, port, "${r.id}|${r.token}",
                     DirectControlSocket.now() + 20000, { current(r) }, { r.socket = it }, { stage(r, it) })
-                ready(r, connection.socket, connection.writer, connection.reader)
+                ready(r, connection.socket, connection.writer, connection.reader, localIp)
             } catch (e: Exception) { if (current(r)) fail(r, "Direct control client (${r.phase}): ${e.message}") }
         }
     }
-    private fun ready(r: Run, socket: Socket, writer: BufferedWriter, reader: BufferedReader) {
+    private fun ready(r: Run, socket: Socket, writer: BufferedWriter, reader: BufferedReader, advertisedIp: String) {
         if (!current(r)) { socket.close(); return }
         r.socket = socket; r.writer = writer; socket.soTimeout = 0
         stage(r, "control-ready")
         main.post {
             if (current(r)) {
                 if (!r.settled) { r.settled = true; r.promise.resolve(true) }
-                emit("onDirectReady", r, Arguments.createMap().apply { putString("localIp", socket.localAddress.hostAddress) })
+                // advertisedIp is the real P2P interface address even when the
+                // control socket itself lives inside the relay's virtual
+                // subnet. Media candidates must keep using the P2P address.
+                emit("onDirectReady", r, Arguments.createMap().apply { putString("localIp", advertisedIp) })
             }
         }
         var closedReason = "peer closed the control connection"
@@ -717,6 +742,7 @@ class DirectWifiModule(private val context: ReactApplicationContext) : ReactCont
         if (!r.requested || manager == null || channel == null) {
             Log.i("DirectWifi", "teardown exit session=${r.id} reason=no-requested-link elapsedMs=0")
             radioReleased = true
+            KeeperVpnService.clearRelay()
             promise?.resolve(true); return
         }
         stopping = true
@@ -736,6 +762,9 @@ class DirectWifiModule(private val context: ReactApplicationContext) : ReactCont
     private fun elapsed(r: Run) = if (r.stopStartedAt == 0L) -1L else SystemClock.elapsedRealtime() - r.stopStartedAt
     private fun cancelAndRelease(r: Run, promise: Promise?) {
         Log.i("DirectWifi", "teardown cancel session=${r.id} elapsedMs=${elapsed(r)}")
+        // The app-side socket is already closed; stop accepting relay
+        // connections and let the bridge drain the hangup bytes.
+        KeeperVpnService.clearRelay()
         if (manager == null || channel == null) {
             Log.i("DirectWifi", "teardown exit session=${r.id} reason=no-manager elapsedMs=${elapsed(r)}")
             stopping = false; radioReleased = true; promise?.resolve(true); return
@@ -834,6 +863,7 @@ class DirectWifiModule(private val context: ReactApplicationContext) : ReactCont
         main.post {
             lifecycleEpoch++
             run?.let { stop(it, null) }
+            KeeperVpnService.clearRelay()
             try { context.unregisterReceiver(receiver) } catch (_: Exception) {}
         }
         io.shutdownNow(); writes.shutdownNow(); super.invalidate()

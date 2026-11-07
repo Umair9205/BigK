@@ -895,8 +895,9 @@ Remaining options for the Infinix, in the order they should be tried:
    tunnel up, the engine logs `importantScene: VPN: packageName=com.anonymous.
    kelakonnect` every 30 s and `fastState: uid=10397 is pending`, with zero
    freezes across screen-on, screen-off and the lock screen. One-time consent
-   dialog, status-bar key icon, replaces any other active VPN, dummy route
-   `192.0.2.0/24` so it carries no real traffic, Play VPN disclosure.
+   dialog, status-bar key icon, defers to any other active VPN, and (round 24)
+   a real local call relay on `10.111.222.0/24` instead of a dummy route; Play
+   VPN disclosure.
 5. **Overlay / chat-head bubble — BUILT, screen-on only (Nov 6, round 23).**
    Prevention via a *visible window* works while the screen is on and unlocked
    (`importantScene: float_window`), verified for 3+ minutes; the keyguard and
@@ -918,9 +919,9 @@ Remaining options for the Infinix, in the order they should be tried:
 ### Round 23 builds (Nov 6) — 1x1 window + keeper VPN: the blocker is FIXED
 
 Two small builds tested the last two prevention ideas the census pointed at.
-Both mechanisms are in the tree (`KeeperActivity.kt`, `KeeperOverlay.kt`, and
-`AvailabilityService` now extends `VpnService`); the gate stayed green for each
-(9 suites + `tsc` + `assembleRelease`). BigK uid is **10397** in this round.
+Both mechanisms are in the tree (`KeeperOverlay.kt` and the separate
+`KeeperVpnService`); the gate stayed green for each (9 suites + `tsc` +
+`assembleRelease`). BigK uid is **10397** in this round.
 
 **Build A — 1x1 overlay window (`KeeperOverlay`).** A 1x1, transparent,
 non-focusable, non-touchable `TYPE_APPLICATION_OVERLAY` window, added by the
@@ -946,15 +947,16 @@ grant; note a reinstall resets that op to `default` (`cmd appops get …` showed
   callingUidHasNonAppVisibleWindow: false … BAL_BLOCK` (result code 102).
   The overlay window is what satisfies `callingUidHasNonAppVisibleWindow`, so
   it is the prerequisite for the 1x1-*activity* variant if that is ever
-  revisited. `KeeperActivity` (a translucent 1x1 activity) is kept in the tree
-  for that experiment but is not started by the current wiring.
+  revisited. `KeeperActivity` (a translucent 1x1 activity) was kept in the
+  tree for that experiment but was never started; it and the other dead probes
+  were removed in round 24.
 
-**Build B — keeper VPN (`AvailabilityService : VpnService`).** The availability
-service now also owns a dummy tunnel: `tun0`, `192.0.2.1/32`, route
-`192.0.2.0/24`, no DNS, no default route, so no real app traffic is captured.
-The tunnel comes up with the service; the watchdog retries `establish()` every
-5 s until the system consent dialog has been accepted. Consent was already
-prepared on this install, so no prompt appeared.
+**Build B — keeper VPN (`KeeperVpnService`).** A separate service owns a dummy
+tunnel: `tun0`, `192.0.2.1/32`, route `192.0.2.0/24`, no DNS, no default route,
+so no real app traffic is captured. (Round 24 replaced the dummy route with a
+real call relay.) The tunnel comes up with availability; the watchdog retries
+`establish()` every 5 s until the system consent dialog has been accepted.
+Consent was already prepared on this install, so no prompt appeared.
 
 Measured on the same install (logcat cleared at start, screen states in
 sequence):
@@ -993,6 +995,71 @@ sleep); either alone has a gap. Side effects to own: the VPN key icon, the
 and the usual always-on battery cost. A 15+ minute soak is running as the
 long-form confirmation; its result is appended below when it lands.
 
+### Round 24 build (Nov 8) — the relay is real, dead probes removed
+
+Build `2BE2FB30E1955D516A051FE1A8DEEB90934AD4EBE3C44620DB241EC0BF2B1678`
+(package `1.1.3-control-recovery`; BigK uid **10399** on the Infinix). Gate
+green: 9 Node suites + `npx tsc --noEmit` + `assembleRelease`.
+
+**Dead probes deleted.** `KeeperActivity`, `KeeperAccessibilityService`,
+`KeeperDeviceAdminReceiver`, their manifest entries, `res/xml` configs and the
+unused string are gone. `aapt2` confirms none of them are in the APK; the
+keeper is now only the overlay (screen-on) and the VPN (screen-off).
+
+**The VPN carries the call control channel.** The dummy `192.0.2.0/24` route is
+replaced by a real local relay:
+
+| | |
+|---|---|
+| tun addresses | `10.111.222.1/32` (app source) and `10.111.222.2/32` (virtual peer) |
+| route | `10.111.222.0/24` only; no DNS, no default route |
+| allowed apps | this package only (`addAllowedApplication`) |
+| app port | `9876` inside the virtual subnet |
+| real port | `9875` on the P2P link, unchanged |
+
+- **Caller**: the app connects from `10.111.222.1` to `10.111.222.2:9876`;
+  `KeeperVpnService` accepts and dials the group owner at `<owner>:9875` with a
+  `protect()`ed socket.
+- **Callee**: the app listens on `10.111.222.2:9876`; the service listens on
+  its real P2P address `:9875`, accepts the peer, and bridges to the app.
+- **Mixed mode works**: the real link always stays on `9875`, so one phone
+  with the VPN and one without still connect (the relayed side bridges to the
+  other phone's ordinary listener).
+- `onDirectReady` still reports the **real P2P address**, not the virtual one,
+  because `DirectCallAudio` filters WebRTC host candidates against it; media
+  therefore stays peer-to-peer on the P2P interface and is not tunnelled.
+- The relay is a per-call job: it starts after the group forms, replaces any
+  previous job, logs `relay carried <n> bytes` every 5 s while bytes move, and
+  stops accepting on teardown (the bridge drains the hangup bytes, then force
+  closes after 3 s). If the keeper tunnel is not ours (WARP owns the slot,
+  consent pending), `configureRelay` returns false and the call uses the real
+  P2P addresses unchanged.
+
+**Soak result (Nov 8).** 15 minutes with `mWakefulness=Dozing`, captured from
+`-b main,system` (120,115 lines, 00:48–01:06): **zero `freeze uid: 10399`**
+(the only textual matches were adbd echoes of the grep command itself),
+**36 `importantScene: VPN: packageName=com.anonymous.kelakonnect`** lines (one
+per 30 s engine cycle), and `P2PProbe` ticks through 01:06:45. Representative
+cycle:
+
+```
+01:05:48.437  3409  3537 I Usf_Hiber/importantScene: isTrafficActive uid:10399 speed :4
+01:05:48.438  3409  3537 I Usf_Hiber/importantScene: uid:10399 speed :4
+01:05:48.438  3409  3537 I Usf_Hiber/importantScene: VPN: packageName=com.anonymous.kelakonnect
+01:06:45.806  1719  1719 I P2PProbe: [watchdog] peers=0
+```
+
+The app was never frozen and the tunnel stayed up for the whole soak; this is
+the round-23 exemption re-confirmed with the real relay configuration in place.
+The relay itself only starts when a call forms, so its end-to-end proof is the
+two-phone call test (grep `KeeperVpn: relay bridged` and `relay carried <n>
+bytes`).
+
+**Limit to own.** The relay transports signalling/control; audio is the
+WebRTC media path and remains direct. The VPN is still single-slot: it defers
+to WARP, and in that state the relay is unavailable (the call falls back to
+the direct path, but the freezer exemption is WARP's, not ours).
+
 ### Deferred / not built
 
 - ~~**P0 owner-address guard / accept-gate logging**~~ — **both built in
@@ -1024,20 +1091,34 @@ long-form confirmation; its result is appended below when it lands.
 1. Install on both phones. First launch shows the **"Keep calls coming in"**
    dialog — tap **Allow**, then **Allow** again on Android's own prompt. (Tap
    `Not now` and the ask is remembered; re-enable via Settings → Battery
-   optimization settings.) Then confirm availability is on, open each phone
-   **once**, press **Home** — not swipe-away, not force-stop. Screen may go off.
+   optimization settings.) Then Android shows the **VPN consent** dialog
+   ("Connection request … BigK") — tap **OK**. That one-time grant is the
+   fix that survives screen-off: it makes XOS's freezer see the app as an
+   active VPN (`importantScene: VPN`). Declining costs background survival
+   only; calls still work while the app is open. Then confirm availability is
+   on, open each phone **once**, press **Home** — not swipe-away, not
+   force-stop. Screen may go off.
+   *Optional extra:* allow **Display over other apps** for the screen-on
+   `float_window` layer. If it is not granted the log shows
+   `Keeper: overlay attach failed … permission denied for window type 2038`
+   and nothing else changes; the VPN carries the fix.
 2. On the Infinix, confirm the log keeps printing
    `P2PProbe: [watchdog] …` **at 5-second intervals for at least 2 minutes
-   after Home.** This is the whole test. Grep `[BatteryExemption]` for
-   `after prompt: unrestricted=true` to confirm the grant landed, and grep
-   `KeepAlive:` for `starting; 1 Hz keep-alive` + `sending to <ip> over
-   Wi-Fi` (before Home) **and `KeepAlive: n= …` counter lines every 10 s
-   after it** — if the counters stop, the ticker died; if they never appear,
-   the keep-alive never started.
+   after Home** — now including with the screen off and on the lock screen.
+   Grep `Availability: VPN keeper tunnel established` once at startup,
+   `importantScene: VPN: packageName=com.anonymous.kelakonnect` every 30 s,
+   and `fastState: uid=<ours> is pending`. The pass condition is **no**
+   `stateManager: freeze uid: <ours>` line at all.
+   Also grep `[BatteryExemption]` for `after prompt: unrestricted=true` and
+   `KeepAlive:` counters every 10 s (if they stop, the ticker died; if they
+   never appear, the keep-alive never started).
 3. If probes stop, grep for the new stop lines first —
    `Availability: Stopping:` / `Service destroyed; watchdog cancelled` — and
    then for the OEM freezer:
-   `Usf_Hiber.*<our-uid>` / `proxyWakeLock.*kelakonnect`.
+   `Usf_Hiber.*<our-uid>` / `proxyWakeLock.*kelakonnect`. If the VPN is the
+   suspect, check `dumpsys connectivity | grep 'VPN CONNECTED'` and
+   `Availability: VPN keeper (tunnel established|revoked|waiting for user
+   consent)`.
    A freeze with **no** stop line is the round-18 bug reproducing.
    **Round-22 = the background call wake experiment** (XOS toggles were
    already applied before round 21 — provisionally negative; full protocol
@@ -1078,6 +1159,9 @@ KeepAlive:      starting; 1 Hz keep-alive over Wi-Fi only | sending to <ip> over
 KeepAlive:      n=<ticks> sent=<n> err=<n> rxPkt=<n> tlsOk=<n> tlsFail=<n> txB=<bytes> rxB=<bytes> phase=burst|sustain wifi=true|false   (every 10 s)
 DirectWifi:     owner address <mac> is a placeholder; authenticating on the session token only
 NearbyModule:   accept gate rejected endpoint=… peer=… directSession=… paused=… unsavedContact=… otherEndpointBusy=…
+Keeper:         overlay attached (1x1, invisible, non-touchable) | overlay removed | overlay attach failed | show requested | activity created; keep-alive surface attached
+KeeperVpn:      Keeper relay tunnel established (10.111.222.1/10.111.222.2, route 10.111.222.0/24, app=…) | relay ready: app 10.111.222.1 -> 10.111.222.2:9876 => peer <ip>:9875 | relay ready: peer <ip>:9875 => app 10.111.222.2:9876 | relay bridged (caller=… peer=…) | relay carried <n> bytes | relay bind/accept/bridge failed: …
+Availability:   VPN keeper waiting for user consent (one-time dialog) | VPN keeper revoked by user/system | other VPN active; keeper idle
 ```
 
 ### Known noise to ignore when grepping

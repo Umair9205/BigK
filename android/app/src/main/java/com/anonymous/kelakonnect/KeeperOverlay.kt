@@ -17,7 +17,7 @@ import android.view.WindowManager
  * false"). A window, unlike an activity, can be added from a service at any
  * time, so this is attached first. Two independent things are being measured:
  *   1. does a visible window by itself keep Usf_Hiber away, and
- *   2. if not, does it at least unlock the KeeperActivity start.
+ *   2. does it keep the process responsive while the screen is on.
  *
  * Deliberately 1x1, transparent, non-focusable and non-touchable: it must not
  * affect what the user sees or taps.
