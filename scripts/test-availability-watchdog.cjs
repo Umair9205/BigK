@@ -26,6 +26,7 @@ function fixture() {
     './NearbyAvailability':{ensureNearbyAvailable:async()=>{counts.advertise++;if(gate)await gate;}},
     './NearbyDiscoveryService':{nearbyDiscoveryService:{startContinuousDiscovery:async()=>{native.scanning=true;counts.scan++;},stopDiscovery:async()=>{native.scanning=false;counts.stop++;}}},
     './CallStateManager':{callStateManager:{getState:()=>callState,subscribe:fn=>{onCall=fn;return ()=>{};}}},
+    '../modules/DirectWifi':{default:{startCallListener:async()=>{},stopCallListener:async()=>{}}},
     '../store/appStore':{useAppStore:{getState:()=>store,subscribe:()=>()=>{}}},
   };
   const js=ts.transpileModule(fs.readFileSync(path.join(root,'services/BackgroundAvailability.ts'),'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020}}).outputText;
@@ -136,7 +137,7 @@ test('native watchdog clears the stuck states that permanently kill scanning',()
   const core=fs.readFileSync(path.join(root,'android/app/src/main/java/com/anonymous/kelakonnect/NearbyTransport.kt'),'utf8');
   const watchdog=core.slice(core.indexOf('fun healthWatchdog'),core.indexOf('private fun reply'));
   // Paused radios are never revived behind the user's back.
-  assert.match(watchdog,/if \(prefs.getBoolean\("paused", true\)\) return@post/);
+  assert.match(watchdog,/if \(!enabled \|\| prefs.getBoolean\("paused", true\)\) return@post/);
   // Stuck direct handoff recovers only after the Wi-Fi radio released.
   assert.match(watchdog,/DirectWifiModule.radioReleased/);
   assert.match(watchdog,/recoverAfterRadioReset\(\)/);

@@ -29,7 +29,7 @@ function fixture(t) {
   const subscribe = key => fn => {handlers[key]=fn;return {remove:()=>delete handlers[key]};};
   const wifi = {
     prepareGroup:async()=>{counts.prepare++;return {token:credentials.token};},
-    getPeerP2pAddress:async(expected)=>{counts.peerAddress++;assert.deepEqual(expected,['Peer Name']);return discoveredPeerAddress;},
+    getPeerP2pAddress:async(uuid,deviceName)=>{counts.peerAddress++;assert.equal(uuid,'peer');assert.equal(deviceName,'Peer Name');return discoveredPeerAddress;},
     connectPeer:async(id,addr,isCaller,token)=>{
       assert.equal(counts.release,1,'Nearby is released before the framework connect');
       assert.equal(addr,discoveredPeerAddress);assert.equal(token,credentials.token);
@@ -154,7 +154,12 @@ test('the call path discovers the peer address and never reads its own',()=>{
     'both the caller placement and the callee incoming path must warm up discovery');
   assert.match(source,/fun warmUpPeerDiscovery\(promise: Promise\)/);
   assert.match(source,/peer discovery warmup failed reason=/);
-  assert.match(address,/main\.post \{ pollPeerAddress\(expected, promise\) \}/);
+  assert.match(address,/main\.post \{ pollPeerAddress\(expected, expectedMac, promise\) \}/);
+  // MAC-keyed path: a saved address resolves before the cold-scan loop, and
+  // the identity tag is published through DNS-SD (no public device-name API).
+  assert.match(address,/by=cached/);
+  assert.match(address,/WifiP2pDnsSdServiceInfo\.newInstance\(tag, SERVICE_TYPE/);
+  assert.match(address,/@ReactMethod fun setDeviceTag/);
   // The read brings Wi-Fi up itself instead of telling the user to toggle it.
   assert.match(address,/ensureWifi \{ enabled ->/);
   assert.doesNotMatch(address,/toggle Wi-Fi/);

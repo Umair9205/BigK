@@ -22,6 +22,7 @@ function fixture(options = {}) {
     './NearbyAvailability':{ensureNearbyAvailable:async()=>{counts.advertise++;if(gate)await gate;}},
     './NearbyDiscoveryService':{nearbyDiscoveryService:{startContinuousDiscovery:async()=>counts.scan++,stopDiscovery:async()=>counts.stop++}},
     './CallStateManager':{callStateManager:{getState:()=>callState,subscribe:fn=>{onCall=fn;return ()=>{};}}},
+    '../modules/DirectWifi':{default:{startCallListener:async()=>{},stopCallListener:async()=>{}}},
     '../store/appStore':{useAppStore:{getState:()=>store,subscribe:fn=>{storeListener=fn;return ()=>{};}}},
   };
   if (options.missingModule) dependencies['react-native'].NativeModules.CallForegroundServiceModule = null;

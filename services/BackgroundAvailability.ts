@@ -4,6 +4,7 @@ import Nearby from '../modules/Nearby';
 import { ensureNearbyAvailable, ensureLocationEnabled, LOCATION_OFF } from './NearbyAvailability';
 import { nearbyDiscoveryService as discovery } from './NearbyDiscoveryService';
 import { callStateManager as calls } from './CallStateManager';
+import wifi from '../modules/DirectWifi';
 import { useAppStore } from '../store/appStore';
 
 export const callNotifications = NativeModules.CallForegroundServiceModule;
@@ -45,6 +46,7 @@ function availabilityLine(status: any): string {
 function markPaused() {
   wanted = false; generation++;
   void discovery.stopDiscovery();
+  void wifi.stopCallListener().catch(() => {});
   void useAppStore.getState().updateSettings({ scanningEnabled: false });
   useAvailability.setState({ enabled: false, vpnActive: false, status: 'Unavailable · local calling paused' });
 }
@@ -58,6 +60,7 @@ export async function pauseAvailability() {
     await pending?.catch(() => {});
     await discovery.stopDiscovery();
     await Nearby.stopAdvertising();
+    await wifi.stopCallListener().catch(() => {});
     await requireCallNotifications('stopAvailability').stopAvailability();
     useAvailability.setState({ enabled: false, vpnActive: false, status: 'Unavailable · local calling paused' });
   } catch (error: any) {
@@ -100,6 +103,18 @@ export function resumeAvailability(request = true, explicitResume = false): Prom
       if (!wanted || ticket !== generation) return;
       await callNotifications.startAvailability(explicitResume);
       if (!wanted || ticket !== generation) return;
+      // Arm the Nearby-free callee listener: it publishes the identity tag,
+      // watches for a saved friend's -CALL beacon, and accepts the
+      // authenticated direct control socket. The foreground service (and the
+      // VPN exemption it owns) keeps this process alive.
+      if (store.myUUID) {
+        // Never re-arm with an empty list: a transient/loading empty would
+        // disarm the callee and reject a call that lands in the gap. Native
+        // keeps the previously armed friends when the incoming list is empty.
+        if (store.friends.length > 0)
+          await wifi.startCallListener(store.myUUID, store.friends.map(f => f.uuid)).catch(() => {});
+        if (!wanted || ticket !== generation) return;
+      }
       if (calls.getState() === 'idle') await discovery.startContinuousDiscovery(useAppStore.getState().friends);
       const status = await callNotifications.availabilityStatus();
       if (!wanted || ticket !== generation) return;
@@ -172,6 +187,8 @@ export function startAvailabilityLifecycle() {
   const contacts = useAppStore.subscribe((next, previous) => {
     if (next.myUUID && next.myDeviceName && (next.friends !== previous.friends || next.myDeviceName !== previous.myDeviceName || next.settings.ringtoneEnabled !== previous.settings.ringtoneEnabled))
       void Nearby.configureAvailability(next.myUUID, next.myDeviceName, next.friends.map(f => ({uuid:f.uuid,name:f.name})), next.settings.ringtoneEnabled).catch(() => {});
+    if (next.myUUID && wanted && next.settings.scanningEnabled && next.friends !== previous.friends && next.friends.length > 0 && calls.getState() === 'idle')
+      void wifi.startCallListener(next.myUUID, next.friends.map(f => f.uuid)).catch(() => {});
     if (next.friends !== previous.friends && wanted && calls.getState() === 'idle') void resumeAvailability(false);
   });
   // Runs in background too: the process, not the screen, is what the scan needs.
@@ -181,5 +198,6 @@ export function startAvailabilityLifecycle() {
   return () => {
     app.remove(); location.remove(); recovered.remove(); paused.remove(); state(); contacts();
     clearInterval(health);
+    void wifi.stopCallListener().catch(() => {});
   };
 }

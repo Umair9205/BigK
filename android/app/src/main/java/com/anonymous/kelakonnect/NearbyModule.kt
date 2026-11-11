@@ -12,6 +12,15 @@ import com.facebook.react.modules.core.DeviceEventManagerModule
 /** Thin UI bridge; the application-scoped transport survives React invalidation. */
 class NearbyModule(private val context: ReactApplicationContext) : ReactContextBaseJavaModule(context) {
     private val transport = NearbyTransport.get(context)
+    // Nearby is unplugged for the Wi-Fi Direct call path (step 4): the JS bridge
+    // flips this off and the transport refuses to touch advertising/discovery
+    // while it is false, so Bluetooth is never switched on for a call.
+    @Volatile private var nearbyEnabled = true
+        private set
+    @ReactMethod fun setNearbyEnabled(enabled: Boolean, promise: Promise) {
+        if (enabled) { nearbyEnabled = true; transport.setEnabled(true) } else { nearbyEnabled = false; transport.setEnabled(false) }
+        promise.resolve(enabled)
+    }
     private val emitter: (String, WritableMap) -> Unit = { name, data ->
         if (context.hasActiveReactInstance()) context.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java).emit(name, data)
     }
@@ -34,14 +43,21 @@ class NearbyModule(private val context: ReactApplicationContext) : ReactContextB
         catch (e: Exception) { promise.reject("LOCATION_SETTINGS", e) }
     }
     @ReactMethod fun configureAvailability(uuid: String, name: String, contacts: String, audible: Boolean, promise: Promise) {
+        if (!nearbyEnabled) { promise.resolve(true); return }
         transport.configure(uuid, name, contacts, audible); promise.resolve(true)
     }
     @ReactMethod fun pendingIncoming(promise: Promise) = transport.pendingIncoming(promise)
     @ReactMethod fun retainConnection(id: String) = transport.retainConnection(id)
     @ReactMethod fun releaseForDirectCall(id: String, promise: Promise) = transport.releaseForDirectCall(id, promise)
     @ReactMethod fun resumeAfterDirectCall(id: String, promise: Promise) = transport.resumeAfterDirectCall(id, promise)
-    @ReactMethod fun startAdvertising(uuid: String, name: String, promise: Promise) = transport.startAdvertising(uuid, name, promise)
-    @ReactMethod fun startDiscovery(uuids: ReadableArray, promise: Promise) = transport.startDiscovery(uuids, promise)
+    @ReactMethod fun startAdvertising(uuid: String, name: String, promise: Promise) {
+        if (!nearbyEnabled) { promise.resolve(false); return }
+        transport.startAdvertising(uuid, name, promise)
+    }
+    @ReactMethod fun startDiscovery(uuids: ReadableArray, promise: Promise) {
+        if (!nearbyEnabled) { promise.resolve(false); return }
+        transport.startDiscovery(uuids, promise)
+    }
     @ReactMethod fun connect(id: String, promise: Promise) = transport.connect(id, promise)
     @ReactMethod fun stopAdvertising(promise: Promise) = transport.stopAdvertising(promise)
     @ReactMethod fun isConnected(id: String, promise: Promise) = transport.isConnected(id, promise)

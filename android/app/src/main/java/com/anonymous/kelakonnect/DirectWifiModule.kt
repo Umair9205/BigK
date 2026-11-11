@@ -7,6 +7,8 @@ import android.net.MacAddress
 import android.net.wifi.WifiManager
 import android.net.wifi.WpsInfo
 import android.net.wifi.p2p.*
+import android.net.wifi.p2p.nsd.WifiP2pDnsSdServiceInfo
+import android.net.wifi.p2p.nsd.WifiP2pDnsSdServiceRequest
 import android.os.*
 import android.provider.Settings
 import android.util.Log
@@ -16,6 +18,7 @@ import com.facebook.react.modules.core.DeviceEventManagerModule
 import java.io.*
 import java.net.*
 import java.security.SecureRandom
+import java.security.MessageDigest
 import java.util.concurrent.Executors
 
 /** Owns one app-created P2P group. TCP is authenticated control only; WebRTC carries audio. */
@@ -33,6 +36,10 @@ class DirectWifiModule(private val context: ReactApplicationContext) : ReactCont
         // "connect to anyone". Today's only source is the peer list, so this is
         // a belt-and-braces guard rather than a value anyone produces.
         private const val MAC_ANY_ADDRESS = "02:00:00:00:00:00"
+        // DNS-SD service type carrying the hashed identity tag. Wi-Fi Direct
+        // has no public setDeviceName(), so a service instance is the supported
+        // way to publish "who this phone is" to a scanning peer.
+        private const val SERVICE_TYPE = "_bigk._tcp"
         // The peer read is the app's first P2P operation of the process, so it
         // must stand alone: Wi-Fi is brought up first (ensureWifi), discovery
         // is kicked, then the peer list is polled long enough for a cold stack
@@ -101,12 +108,34 @@ class DirectWifiModule(private val context: ReactApplicationContext) : ReactCont
     private val wifiWaits = mutableListOf<WifiEnableWait>()
     private var wifiPanelOpen = false
     @Volatile private var run: Run? = null
+    @Volatile private var deviceTag: String? = null
+    @Volatile private var identityUuid: String? = null
+    @Volatile private var friendUuids: Set<String> = emptySet()
+    @Volatile private var friendTags: Set<String> = emptySet()
+    @Volatile private var beaconOn = false
+    @Volatile private var beaconSession: String? = null
+    @Volatile private var listenerRunning = false
+    @Volatile private var listenerServer: ServerSocket? = null
+    private var listenerThread: Thread? = null
+    private var discoveryThread: Thread? = null
+    private val joiningCall = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+    // TXT sid per beaconing peer, so the callee can derive the pair token and
+    // dial the caller when the caller won group ownership.
+    private val beaconSessions = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private var advertisedTag: String? = null
+    private var dnsSdInstalled = false
+    private var serviceRequestAdded = false
+    // Wi-Fi Direct exposes no public setDeviceName(), so the identity tag is
+    // advertised as a DNS-SD service instance ("BK-<hash>"). Peers learn the
+    // tag -> P2P address mapping from discoverServices().
+    private val serviceMacs = java.util.concurrent.ConcurrentHashMap<String, String>()
     private var stopping = false
     private var lifecycleEpoch = 0
     private var focus: AudioFocusRequest? = null
     private val audio get() = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-    private class Run(val id: String, val caller: Boolean, val token: String, val promise: Promise) {
+    private class Run(val id: String, val caller: Boolean, val token: String, val promise: Promise?) {
         @Volatile var live = true
+        @Volatile var relay = true
         @Volatile var socket: Socket? = null
         @Volatile var server: ServerSocket? = null
         @Volatile var writer: BufferedWriter? = null
@@ -151,6 +180,9 @@ class DirectWifiModule(private val context: ReactApplicationContext) : ReactCont
             if (intent.action == WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION &&
                 intent.getIntExtra(WifiP2pManager.EXTRA_WIFI_STATE, -1) == WifiP2pManager.WIFI_P2P_STATE_DISABLED) {
                 radioReleased = true
+                // The framework drops local services on a radio reset; force
+                // the listener loop to re-advertise the identity tag.
+                advertisedTag = null
             }
             if (intent.action == WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION &&
                 intent.getIntExtra(WifiP2pManager.EXTRA_WIFI_STATE, -1) == WifiP2pManager.WIFI_P2P_STATE_ENABLED &&
@@ -212,6 +244,7 @@ class DirectWifiModule(private val context: ReactApplicationContext) : ReactCont
     override fun initialize() {
         super.initialize()
         ensureChannel()
+        applyDeviceTag()
         context.registerReceiver(receiver, IntentFilter().apply {
             addAction(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION)
             addAction(WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION)
@@ -228,9 +261,15 @@ class DirectWifiModule(private val context: ReactApplicationContext) : ReactCont
         var opened: WifiP2pManager.Channel? = null
         opened = m.initialize(context, Looper.getMainLooper()) {
             run?.let { fail(it, "Wi-Fi Direct service disconnected") }
-            if (channel === opened) channel = null
+            if (channel === opened) {
+                channel = null
+                dnsSdInstalled = false
+                serviceRequestAdded = false
+                advertisedTag = null
+            }
         }
         channel = opened
+        if (opened != null) installDnsSdListeners(m, opened)
         return opened
     }
     private fun begin(id: String, caller: Boolean, token: String, promise: Promise, attempt: Int = 0, epoch: Int = lifecycleEpoch, action: (Run) -> Unit) {
@@ -336,16 +375,519 @@ class DirectWifiModule(private val context: ReactApplicationContext) : ReactCont
      *  readable, and createGroup is refused P2P_UNSUPPORTED at every timing and
      *  with discovery running. requestPeers() returns the OTHER phone's address,
      *  and both sides need exactly that — so no local read happens at all. */
-    @ReactMethod fun getPeerP2pAddress(expected: ReadableArray, promise: Promise) {
+    @ReactMethod fun getPeerP2pAddress(expected: ReadableArray, expectedMac: String?, promise: Promise) {
         main.post {
             try {
                 // First Wi-Fi touch of the handoff: discovery cannot run while
                 // Wi-Fi is off, and the user only ever presses Call.
                 ensureWifi { enabled ->
                     if (!enabled) { promise.reject("P2P_PEER_ADDRESS", "Wi-Fi is off"); return@ensureWifi }
-                    main.post { pollPeerAddress(expected, promise) }
+                    // Publish our identity tag before the peer scans us.
+                    applyDeviceTag()
+                    main.post { pollPeerAddress(expected, expectedMac, promise) }
                 }
             } catch (e: Exception) { promise.reject("P2P_PEER_ADDRESS", e.message) }
+        }
+    }
+    /** Publish this phone's stable P2P identity tag (BK-&lt;hash&gt;) so a peer
+     *  can match a saved friend by tag instead of guessing "the single
+     *  available device". Wi-Fi Direct has no public setDeviceName(); the
+     *  supported channel is a DNS-SD service instance. The tag is remembered
+     *  while Wi-Fi is off and applied on the next radio touch. */
+    @ReactMethod fun setDeviceTag(tag: String, promise: Promise) {
+        main.post {
+            deviceTag = tag.trim().take(32)
+            applyDeviceTag()
+            promise.resolve(true)
+        }
+    }
+    private fun applyDeviceTag() {
+        val base = deviceTag ?: return
+        val tag = if (beaconOn) "$base-CALL" else base
+        if (wifiState?.isWifiEnabled != true) return
+        val m = manager ?: return
+        val c = ensureChannel() ?: return
+        if (advertisedTag == tag) return
+        try {
+            // A stale instance with the same name makes addLocalService fail;
+            // clearing first keeps re-advertisement after Wi-Fi cycles reliable.
+            m.clearLocalServices(c, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() { advertiseTag(m, c, tag) }
+                override fun onFailure(reason: Int) { advertiseTag(m, c, tag) }
+            })
+        } catch (e: Exception) { Log.i("DirectWifi", "P2P tag advertise unavailable: ${e.message}") }
+    }
+    private fun advertiseTag(m: WifiP2pManager, c: WifiP2pManager.Channel, tag: String) {
+        // clearLocalServices/addLocalService are async; a later applyDeviceTag
+        // may have changed the desired tag (e.g. the dial's -CALL beacon).
+        // Never let a stale callback overwrite the current beacon, or the
+        // callee's 6 s discovery poll never sees -CALL and never joins.
+        val desired = deviceTag?.let { if (beaconOn) "$it-CALL" else it }
+        if (tag != desired) return
+        try {
+            val txt = mutableMapOf("tag" to tag)
+            // The callee can be the group client (the caller re-invoked a
+            // persistent group and stayed owner). It then has to dial us, so
+            // publish the session id it needs to derive the pair token.
+            if (beaconOn) beaconSession?.let { txt["sid"] = it }
+            val info = WifiP2pDnsSdServiceInfo.newInstance(tag, SERVICE_TYPE, txt)
+            m.addLocalService(c, info, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() {
+                    advertisedTag = tag
+                    Log.i("DirectWifi", "P2P tag advertised $tag")
+                }
+                override fun onFailure(reason: Int) {
+                    Log.i("DirectWifi", "P2P tag advertise failed reason=$reason")
+                }
+            })
+        } catch (e: Exception) { Log.i("DirectWifi", "P2P tag advertise threw: ${e.message}") }
+    }
+    /** Tag -> P2P address learned from DNS-SD. The framework gives no writable
+     *  device name, so this is the only supported identity channel. */
+    private fun installDnsSdListeners(m: WifiP2pManager, c: WifiP2pManager.Channel) {
+        if (dnsSdInstalled) return
+        try {
+            m.setDnsSdResponseListeners(c,
+                { instanceName, _, srcDevice ->
+                    val name = instanceName?.trim()
+                    if (!name.isNullOrEmpty() && srcDevice != null) {
+                        serviceMacs[name] = srcDevice.deviceAddress
+                        if (name.endsWith("-CALL")) {
+                            val base = name.removeSuffix("-CALL")
+                            if (base in friendTags) maybeJoinCallGroup(base, srcDevice.deviceAddress)
+                        }
+                    }
+                },
+                { _, txtRecordMap, srcDevice ->
+                    val name = txtRecordMap?.get("tag")?.trim()
+                    if (!name.isNullOrEmpty() && srcDevice != null) {
+                        txtRecordMap["sid"]?.trim()?.takeIf { it.isNotEmpty() }?.let {
+                            beaconSessions[srcDevice.deviceAddress] = it
+                        }
+                        serviceMacs[name] = srcDevice.deviceAddress
+                        if (name.endsWith("-CALL")) {
+                            val base = name.removeSuffix("-CALL")
+                            if (base in friendTags) maybeJoinCallGroup(base, srcDevice.deviceAddress)
+                        }
+                    }
+                })
+            dnsSdInstalled = true
+            Log.i("DirectWifi", "P2P DNS-SD listeners installed")
+            ensureServiceRequest(m, c) {}
+        } catch (e: Exception) { Log.i("DirectWifi", "P2P DNS-SD listeners unavailable: ${e.message}") }
+    }
+    private fun kickServiceDiscovery(m: WifiP2pManager, c: WifiP2pManager.Channel) {
+        ensureServiceRequest(m, c) {
+            try {
+                m.discoverServices(c, object : WifiP2pManager.ActionListener {
+                    override fun onSuccess() {}
+                    override fun onFailure(reason: Int) {
+                        Log.i("DirectWifi", "P2P service discovery kick failed reason=$reason")
+                    }
+                })
+            } catch (_: Exception) {}
+        }
+    }
+    /** Service discovery only reports DNS-SD instances after a matching service
+     *  request is registered. Without it discoverServices() fails with
+     *  NO_SERVICE_REQUESTS (3) and the identity/`-CALL` beacons are never
+     *  resolved, so the callee never learns to join the group as its owner. */
+    private fun ensureServiceRequest(m: WifiP2pManager, c: WifiP2pManager.Channel, then: () -> Unit) {
+        if (serviceRequestAdded) { then(); return }
+        try {
+            val request = WifiP2pDnsSdServiceRequest.newInstance(SERVICE_TYPE)
+            m.addServiceRequest(c, request, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() {
+                    serviceRequestAdded = true
+                    Log.i("DirectWifi", "P2P service request added")
+                    then()
+                }
+                override fun onFailure(reason: Int) {
+                    // BUSY usually means a request is already registered.
+                    if (reason == WifiP2pManager.BUSY) serviceRequestAdded = true
+                    Log.i("DirectWifi", "P2P service request failed reason=$reason")
+                    then()
+                }
+            })
+        } catch (e: Exception) {
+            Log.i("DirectWifi", "P2P service request threw: ${e.message}")
+            then()
+        }
+    }
+
+    // ===== Nearby-free call bootstrap: DNS-SD beacon + direct listener =====
+
+    private fun sha256Hex(value: String): String =
+        MessageDigest.getInstance("SHA-256").digest(value.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it.toInt() and 255) }
+
+    /** Same derivation as services/P2pIdentity.pairToken: sorted UUID pair + session. */
+    private fun pairToken(a: String, b: String, sessionId: String): String {
+        val pair = listOf(a.trim().lowercase(), b.trim().lowercase()).sorted().joinToString(":")
+        return sha256Hex("$pair:$sessionId")
+    }
+
+    private fun p2pTagFor(uuid: String): String =
+        if (uuid.isBlank()) "" else "BK-" + sha256Hex(uuid.trim().lowercase()).take(12)
+
+    private fun emitRaw(event: String, data: WritableMap) {
+        context.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java).emit(event, data)
+    }
+
+    /** Arm the always-on callee side: keep the identity tag advertised, keep
+     *  discovering for a friend's -CALL beacon, and accept the authenticated
+     *  direct control socket on the P2P port. Nothing here touches Nearby. */
+    @ReactMethod fun startCallListener(myUuid: String, friends: String, promise: Promise) {
+        main.post {
+            identityUuid = myUuid
+            // A store update can briefly report an empty list while contacts are
+            // (re)loading; keep the armed set rather than disarming the callee
+            // and rejecting a call that lands in that gap. A genuinely empty
+            // list on a fresh listener (first arm) stays empty as expected.
+            val nextFriends = friends.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+            if (nextFriends.isNotEmpty()) friendUuids = nextFriends
+            friendTags = friendUuids.map { p2pTagFor(it) }.toSet()
+            deviceTag = p2pTagFor(myUuid)
+            // An active dial owns the -CALL beacon; a JS re-arm (triggered when
+            // the resolved MAC is saved mid-dial) must not clear it.
+            if (run == null) {
+                beaconOn = false
+                beaconSession = null
+                advertisedTag = null
+            }
+            applyDeviceTag()
+            startListenerThread()
+            startDiscoveryLoop()
+            Log.i("DirectWifi", "call listener armed friends=${friendUuids.size}")
+            promise.resolve(true)
+        }
+    }
+
+    @ReactMethod fun stopCallListener(promise: Promise) {
+        main.post {
+            listenerRunning = false
+            try { listenerServer?.close() } catch (_: Exception) {}
+            listenerServer = null
+            promise.resolve(true)
+        }
+    }
+
+    private fun startListenerThread() {
+        if (listenerRunning) return
+        listenerRunning = true
+        listenerThread = Thread {
+            while (listenerRunning) {
+                // A live call may need the P2P port itself (dial-side server).
+                if (run != null) {
+                    try { Thread.sleep(300) } catch (_: InterruptedException) { return@Thread }
+                    continue
+                }
+                try {
+                    val server = ServerSocket()
+                    server.reuseAddress = true
+                    server.bind(InetSocketAddress(KeeperVpnService.PEER_PORT))
+                    server.soTimeout = 1000
+                    listenerServer = server
+                    Log.i("DirectWifi", "call listener on :${KeeperVpnService.PEER_PORT}")
+                    while (listenerRunning && run == null) {
+                        val socket = try { server.accept() } catch (_: SocketTimeoutException) { continue }
+                        try { handleIncoming(socket) } catch (e: Exception) {
+                            Log.i("DirectWifi", "incoming call handshake failed: ${e.message}")
+                            try { socket.close() } catch (_: Exception) {}
+                        }
+                    }
+                    try { server.close() } catch (_: Exception) {}
+                    listenerServer = null
+                    while (listenerRunning && run != null) Thread.sleep(200)
+                } catch (e: Exception) {
+                    if (listenerRunning) {
+                        Log.i("DirectWifi", "call listener error: ${e.message}")
+                        try { Thread.sleep(800) } catch (_: InterruptedException) {}
+                    }
+                }
+            }
+        }.apply { isDaemon = true; name = "BigKCallListener"; start() }
+    }
+
+    /** Accept one caller: auth line, OK, then the call-request that names the
+     *  caller. The token is derived from the two UUIDs, so no Nearby exchange. */
+    private fun handleIncoming(socket: Socket) {
+        var handedOff = false
+        try {
+            socket.tcpNoDelay = true
+            socket.soTimeout = 10000
+            val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
+            val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8))
+            val auth = DirectControlSocket.readLine(reader, 256) ?: return
+            val parts = auth.split('|')
+            if (parts.size < 2) return
+            val sessionId = parts[0]
+            val token = parts[1]
+            if (!sessionId.matches(Regex("[a-zA-Z0-9-]{1,100}")) || !token.matches(Regex("[a-f0-9]{64}"))) return
+            // The client waits for OK before it sends the call-request. Answer
+            // first, then read the identity line.
+            writer.write("OK\n"); writer.flush()
+            val hello = DirectControlSocket.readLine(reader, 65536) ?: return
+            val msg = try { org.json.JSONObject(hello) } catch (_: Exception) { return }
+            if (msg.optString("type") != "call-request") return
+            val from = msg.optString("from")
+            val me = identityUuid ?: return
+            if (from.isEmpty() || from !in friendUuids) return
+            val expected = pairToken(me, from, sessionId)
+            if (!MessageDigest.isEqual(token.toByteArray(Charsets.UTF_8), expected.toByteArray(Charsets.UTF_8))) {
+                Log.i("DirectWifi", "incoming call rejected: token mismatch")
+                return
+            }
+            val localIp = socket.localAddress?.hostAddress ?: ""
+            val callerName = msg.optJSONObject("data")?.optString("callerName").orEmpty()
+            val r = Run(sessionId, false, token, null)
+            r.socketStarted = true
+            r.settled = true
+            r.peerAddress = socket.inetAddress?.hostAddress ?: ""
+            run = r
+            handedOff = true
+            Log.i("DirectWifi", "incoming call session=$sessionId from=$from localIp=$localIp")
+            main.post {
+                emitRaw("onIncomingCall", Arguments.createMap().apply {
+                    putString("sessionId", sessionId)
+                    putString("from", from)
+                    putString("callerName", if (callerName.isBlank()) "Contact" else callerName)
+                    putString("localIp", localIp)
+                })
+            }
+            ready(r, socket, writer, reader, localIp)
+        } finally {
+            // A failed handshake must not leave an unauthenticated socket open.
+            if (!handedOff) { try { socket.close() } catch (_: Exception) {} }
+        }
+    }
+
+    private fun startDiscoveryLoop() {
+        if (discoveryThread?.isAlive == true) return
+        discoveryThread = Thread {
+            while (listenerRunning) {
+                try {
+                    main.post {
+                        if (run != null || wifiState?.isWifiEnabled != true) return@post
+                        // Self-heal across Wi-Fi toggles: the channel and the
+                        // advertised tag may have been skipped while the radio
+                        // was off at app start.
+                        ensureChannel()
+                        applyDeviceTag()
+                        val m = manager
+                        val c = channel
+                        if (m != null && c != null) {
+                            m.discoverPeers(c, null)
+                            kickServiceDiscovery(m, c)
+                        }
+                    }
+                } catch (_: Exception) {}
+                try { Thread.sleep(6000) } catch (_: InterruptedException) { return@Thread }
+            }
+        }.apply { isDaemon = true; name = "BigKCallDiscovery"; start() }
+    }
+
+    private fun maybeJoinCallGroup(tag: String, mac: String) {
+        if (run != null || !listenerRunning) return
+        if (joiningCall.putIfAbsent(mac, true) != null) return
+        Log.i("DirectWifi", "call beacon $tag at $mac; joining the group as callee")
+        joinCallGroup(tag, mac, 0)
+        // Poll the group role regardless of connect()'s result: this stack
+        // bounces connect() with ERROR/BUSY even when a persistent group has
+        // already auto-rejoined us as a client.
+        pollCalleeRole(tag, mac, 0)
+        // Keep the entry for the caller's 25 s auth window; the beacon is
+        // re-seen every ~6 s and must not restart the join mid-negotiation.
+        main.postDelayed({
+            joiningCall.remove(mac)
+            beaconSessions.remove(mac)
+            Log.i("DirectWifi", "callee join window closed for $mac")
+        }, 22000)
+    }
+    /** A single connect() often bounces with ERROR/BUSY while the peer is also
+     *  dialling, so keep re-driving it inside the join window instead of
+     *  waiting for the next 6 s discovery tick (the caller gives up at 25 s). */
+    private fun joinCallGroup(tag: String, mac: String, attempt: Int) {
+        if (run != null || !listenerRunning || !joiningCall.containsKey(mac)) { joiningCall.remove(mac); return }
+        main.post {
+            try {
+                ensureWifi { enabled ->
+                    if (!enabled) { joiningCall.remove(mac); return@ensureWifi }
+                    val m = manager
+                    val c = ensureChannel()
+                    if (m == null || c == null) { joiningCall.remove(mac); return@ensureWifi }
+                    val config = try {
+                        WifiP2pConfig.Builder().setDeviceAddress(MacAddress.fromString(mac))
+                            .setGroupOperatingBand(WifiP2pConfig.GROUP_OWNER_BAND_2GHZ).build()
+                            .also { it.groupOwnerIntent = CALLEE_GO_INTENT; it.wps.setup = WpsInfo.PBC }
+                    } catch (e: IllegalStateException) {
+                        WifiP2pConfig().apply {
+                            deviceAddress = mac
+                            groupOwnerIntent = CALLEE_GO_INTENT
+                            wps.setup = WpsInfo.PBC
+                        }
+                    }
+                    m.connect(c, config, object : WifiP2pManager.ActionListener {
+                        override fun onSuccess() {
+                            Log.i("DirectWifi", "callee join accepted for $mac; waiting for the group")
+                        }
+                        override fun onFailure(reason: Int) {
+                            Log.i("DirectWifi", "callee join failed reason=$reason attempt=$attempt")
+                            if (reason != WifiP2pManager.P2P_UNSUPPORTED && attempt < 8)
+                                main.postDelayed({ joinCallGroup(tag, mac, attempt + 1) }, 700L)
+                            else joiningCall.remove(mac)
+                        }
+                    })
+                }
+            } catch (e: Exception) {
+                Log.i("DirectWifi", "callee join unavailable: ${e.message}")
+                joiningCall.remove(mac)
+            }
+        }
+    }
+    /** Whichever side the framework picked as client dials the other's control
+     *  listener. The caller already does this in queryGroup(). The callee does
+     *  not: it used to only listen, which deadlocked whenever the caller became
+     *  group owner (it re-invokes a persistent group as owner), leaving both
+     *  phones listening and nobody connecting. */
+    private fun pollCalleeRole(tag: String, mac: String, attempt: Int) {
+        if (run != null || !listenerRunning || !joiningCall.containsKey(mac)) return
+        if (attempt > 80) { joiningCall.remove(mac); return }
+        main.postDelayed({
+            if (run != null || !listenerRunning || !joiningCall.containsKey(mac)) return@postDelayed
+            val m = manager
+            val c = channel
+            if (m == null || c == null) { joiningCall.remove(mac); return@postDelayed }
+            try {
+                m.requestConnectionInfo(c) { info ->
+                    if (run != null || !joiningCall.containsKey(mac)) return@requestConnectionInfo
+                    if (!info.groupFormed) { pollCalleeRole(tag, mac, attempt + 1); return@requestConnectionInfo }
+                    if (info.isGroupOwner) {
+                        // The caller is the client; it dials our listener.
+                        Log.i("DirectWifi", "callee is the group owner; waiting for the caller's control connection")
+                        return@requestConnectionInfo
+                    }
+                    val sid = beaconSessions[mac]
+                    val caller = friendUuids.firstOrNull { p2pTagFor(it) == tag }
+                    if (sid == null || sid.isEmpty() || caller == null) {
+                        // The beacon TXT (sid) may still be resolving.
+                        pollCalleeRole(tag, mac, attempt + 1); return@requestConnectionInfo
+                    }
+                    m.requestGroupInfo(c) { group ->
+                        if (run != null || !joiningCall.containsKey(mac)) return@requestGroupInfo
+                        if (group == null) { pollCalleeRole(tag, mac, attempt + 1); return@requestGroupInfo }
+                        val ownerMac = group.owner?.deviceAddress?.lowercase()
+                        if (ownerMac != null && ownerMac != mac &&
+                            ownerMac != MAC_ANY_ADDRESS && ownerMac != "00:00:00:00:00:00") {
+                            Log.i("DirectWifi", "callee group owner $ownerMac is not the caller $mac")
+                            pollCalleeRole(tag, mac, attempt + 1); return@requestGroupInfo
+                        }
+                        // groupFormed can precede the client's DHCP/interface.
+                        val local = try {
+                            NetworkInterface.getByName(group.getInterface())?.inetAddresses?.toList()
+                                ?.filterIsInstance<Inet4Address>()?.firstOrNull { !it.isLoopbackAddress && !it.isAnyLocalAddress }
+                        } catch (_: SocketException) { null }
+                        val ownerIp = info.groupOwnerAddress?.hostAddress
+                        if (local == null || ownerIp == null) {
+                            pollCalleeRole(tag, mac, attempt + 1); return@requestGroupInfo
+                        }
+                        startCalleeClient(sid, caller, ownerIp, mac, local)
+                    }
+                }
+            } catch (_: Exception) { pollCalleeRole(tag, mac, attempt + 1) }
+        }, 250)
+    }
+    /** Callee as group client: open the control socket to the caller's listener
+     *  exactly as the caller-side client does, then read the call-request the
+     *  caller's JS sends once its listener is ready. */
+    private fun startCalleeClient(sid: String, caller: String, host: String, mac: String, local: Inet4Address) {
+        if (run != null || !listenerRunning) return
+        val me = identityUuid ?: return
+        joiningCall.remove(mac); beaconSessions.remove(mac)
+        val token = pairToken(me, caller, sid)
+        val r = Run(sid, false, token, null)
+        r.peerAddress = mac
+        r.relay = false
+        r.owner = false
+        run = r
+        // Free the P2P port; the listener rebinds if this attempt fails.
+        try { listenerServer?.close() } catch (_: Exception) {}
+        listenerServer = null
+        Log.i("DirectWifi", "callee is the group client; dialling the caller at $host:${KeeperVpnService.PEER_PORT} session=$sid")
+        io.execute {
+            try {
+                val connection = DirectControlSocket.connect(local, InetAddress.getByName(host),
+                    KeeperVpnService.PEER_PORT, "$sid|$token", DirectControlSocket.now() + 8000,
+                    { current(r) }, { r.socket = it }, { stage(r, it) })
+                connection.socket.soTimeout = 10000
+                val hello = DirectControlSocket.readLine(connection.reader, 65536)
+                    ?: throw IOException("caller closed before its call-request")
+                val msg = org.json.JSONObject(hello)
+                if (msg.optString("type") != "call-request" || msg.optString("from") != caller)
+                    throw IOException("unexpected call-request identity")
+                connection.socket.soTimeout = 0
+                r.socket = connection.socket
+                r.writer = connection.writer
+                r.settled = true
+                val localIp = connection.socket.localAddress?.hostAddress ?: local.hostAddress ?: ""
+                val callerName = msg.optJSONObject("data")?.optString("callerName").orEmpty()
+                Log.i("DirectWifi", "incoming call (client dial) session=$sid from=$caller localIp=$localIp")
+                main.post {
+                    if (!current(r)) return@post
+                    emitRaw("onIncomingCall", Arguments.createMap().apply {
+                        putString("sessionId", sid)
+                        putString("from", caller)
+                        putString("callerName", if (callerName.isBlank()) "Contact" else callerName)
+                        putString("localIp", localIp)
+                    })
+                }
+                ready(r, connection.socket, connection.writer, connection.reader, localIp)
+            } catch (e: Exception) {
+                if (current(r)) {
+                    Log.i("DirectWifi", "callee client dial failed: ${e.message}")
+                    main.post { if (current(r)) fail(r, "Direct control client (callee): ${e.message}") }
+                }
+            }
+        }
+    }
+
+    /** Dial a saved friend with no Nearby bootstrap: form the group, open the
+     *  authenticated direct control socket, and let JS send call-request. */
+    @ReactMethod fun dialCall(id: String, peerAddress: String, peerUuid: String, promise: Promise) {
+        main.post {
+            try {
+                val me = identityUuid ?: throw IllegalStateException("Local calling is not ready")
+                val token = pairToken(me, peerUuid, id)
+                // Free the P2P port: the dial-side client does not need it, but
+                // a dial that becomes group owner does.
+                try { listenerServer?.close() } catch (_: Exception) {}
+                listenerServer = null
+                beaconOn = true
+                beaconSession = id
+                advertisedTag = null
+                applyDeviceTag()
+                begin(id, true, token, promise) { r ->
+                    r.relay = false
+                    val mac = MacAddress.fromString(peerAddress)
+                    r.peerAddress = mac.toString()
+                    val config = try {
+                        WifiP2pConfig.Builder().setDeviceAddress(mac)
+                            .setGroupOperatingBand(WifiP2pConfig.GROUP_OWNER_BAND_2GHZ).build()
+                            .also { it.groupOwnerIntent = CALLER_GO_INTENT; it.wps.setup = WpsInfo.PBC }
+                    } catch (e: IllegalStateException) {
+                        WifiP2pConfig().apply {
+                            deviceAddress = mac.toString()
+                            groupOwnerIntent = CALLER_GO_INTENT
+                            wps.setup = WpsInfo.PBC
+                        }
+                    }
+                    r.config = config
+                    r.requested = true
+                    stage(r, "connecting-peer")
+                    radioReleased = false
+                    issueConnect(r)
+                }
+            } catch (e: Exception) { promise.reject("DIAL_FAILED", e.message) }
         }
     }
     /** Opportunistic head start. Discovery needs seconds to surface the peer —
@@ -366,16 +908,18 @@ class DirectWifiModule(private val context: ReactApplicationContext) : ReactCont
                 android.util.Log.i("DirectWifi", "peer discovery warmup skipped; no channel")
                 promise.resolve(null); return@post
             }
+            applyDeviceTag()
             try {
                 activeManager.discoverPeers(activeChannel, object : WifiP2pManager.ActionListener {
                     override fun onSuccess() { android.util.Log.i("DirectWifi", "peer discovery warmed up") }
                     override fun onFailure(reason: Int) { android.util.Log.i("DirectWifi", "peer discovery warmup failed reason=$reason") }
                 })
             } catch (_: Exception) {}
+            kickServiceDiscovery(activeManager, activeChannel)
             promise.resolve(null)
         }
     }
-    private fun pollPeerAddress(expected: ReadableArray, promise: Promise) {
+    private fun pollPeerAddress(expected: ReadableArray, expectedMac: String?, promise: Promise) {
         try {
             val activeManager = manager ?: throw IllegalStateException("Wi-Fi Direct is unavailable")
             val activeChannel = ensureChannel() ?: throw IllegalStateException("Wi-Fi Direct is unavailable")
@@ -407,6 +951,7 @@ class DirectWifiModule(private val context: ReactApplicationContext) : ReactCont
                         }
                     })
                 } catch (_: Exception) {}
+                kickServiceDiscovery(activeManager, activeChannel)
             }
             fun attempt(triesLeft: Int) {
                 activeManager.requestPeers(activeChannel) { list ->
@@ -414,7 +959,19 @@ class DirectWifiModule(private val context: ReactApplicationContext) : ReactCont
                     val peers = (list?.deviceList ?: emptyList()).toList()
                     lastSeen = if (peers.isEmpty()) "no peers seen"
                                else peers.joinToString("; ") { p -> p.deviceName + "|" + p.deviceAddress + "|" + p.status }
-                    // Named match first: the contact is identified, never guessed.
+                    // MAC-keyed path: a saved address is the strongest identity
+                    // signal. If the peer is already visible, resolve at once
+                    // instead of waiting out the cold-scan poll loop.
+                    if (!expectedMac.isNullOrEmpty()) {
+                        val cached = peers.firstOrNull { p -> p.deviceAddress.equals(expectedMac, true) }
+                        if (cached != null) {
+                            main.removeCallbacks(deadline)
+                            Log.i("MacMap", "contact=cache device=${cached.deviceName} mac=${cached.deviceAddress} by=cached")
+                            end(cached.deviceAddress, "cached")
+                            return@requestPeers
+                        }
+                    }
+                    // Named/tag match next: the contact is identified, never guessed.
                     val named = peers.firstOrNull { p ->
                         val dn = p.deviceName.trim()
                         dn.isNotEmpty() && names.any { n -> dn.equals(n, true) }
@@ -423,6 +980,15 @@ class DirectWifiModule(private val context: ReactApplicationContext) : ReactCont
                         main.removeCallbacks(deadline)
                         Log.i("MacMap", "contact=$names device=${named.deviceName} mac=${named.deviceAddress} by=name")
                         end(named.deviceAddress, "name=${named.deviceName}")
+                        return@requestPeers
+                    }
+                    // DNS-SD tag match: the identity tag is advertised as a
+                    // service instance because the device name is not writable.
+                    val fromService = names.firstNotNullOfOrNull { n -> serviceMacs[n] }
+                    if (fromService != null) {
+                        main.removeCallbacks(deadline)
+                        Log.i("MacMap", "contact=$names mac=$fromService by=dnssd")
+                        end(fromService, "dnssd")
                         return@requestPeers
                     }
                     // Exactly one phone offering itself: unambiguous today on both
@@ -438,12 +1004,42 @@ class DirectWifiModule(private val context: ReactApplicationContext) : ReactCont
                     if (peers.isNotEmpty() || triesLeft % 8 == 0)
                         android.util.Log.i("DirectWifi", "peer read left=$triesLeft peers=$lastSeen")
                     if (triesLeft <= 0) { main.removeCallbacks(deadline); end(null, null); return@requestPeers }
+                    // Re-kick P2P peer discovery every 8 polls (~2s): a single find
+                    // window can close before the peer enters its discoverable state,
+                    // so repeating it across the whole poll window keeps discovery
+                    // alive. No user action is needed (see round-7 re-kick lever).
+                    if (triesLeft % 8 == 0) {
+                        try { activeManager.discoverPeers(activeChannel, null) } catch (_: Exception) {}
+                    }
                     main.postDelayed({ attempt(triesLeft - 1) }, ADDRESS_POLL_MS)
                 }
             }
+        // Clear an idle leftover P2P group this phone owns before discovery:
+        // a stale persistent group blocks the framework so discoverPeers /
+        // addLocalService fail with ERROR and no peer ever surfaces
+        // (round-8 group-clearing, run before address resolution).
+        clearIdleLeftoverGroup(activeManager, activeChannel) {
             kick()
             attempt(ADDRESS_ATTEMPTS)
-        } catch (e: Exception) { promise.reject("P2P_PEER_ADDRESS", e.message) }
+        }
+    } catch (e: Exception) { promise.reject("P2P_PEER_ADDRESS", e.message) }
+    }
+    /** Clear an idle leftover P2P group this phone owns so the framework is
+     *  not blocked holding a stale link. requestGroupInfo only ever reports a
+     *  group this phone belongs to; an owner group with no clients is carrying
+     *  nobody's traffic and is safe to remove. */
+    private fun clearIdleLeftoverGroup(m: WifiP2pManager, c: WifiP2pManager.Channel, onDone: () -> Unit) {
+        try {
+            m.requestGroupInfo(c, object : WifiP2pManager.GroupInfoListener {
+                override fun onGroupInfoAvailable(group: WifiP2pGroup?) {
+                    if (group != null && group.isGroupOwner && group.clientList.size == 0) {
+                        try { m.removeGroup(c, null) } catch (_: Exception) {}
+                        android.util.Log.i("DirectWifi", "cleared idle leftover P2P group before discovery")
+                    }
+                    onDone()
+                }
+            })
+        } catch (_: Exception) { onDone() }
     }
     /** Location is a standing precondition for P2P discovery and group
      *  formation; without it the framework refuses both. */
@@ -619,7 +1215,7 @@ class DirectWifiModule(private val context: ReactApplicationContext) : ReactCont
                 // Any failure falls back to the direct path unchanged.
                 val localIp = local.hostAddress
                 if (localIp == null) { fail(r, "Direct control host: local P2P address unavailable"); return@execute }
-                val relayed = KeeperVpnService.configureRelay(false, localIp, localIp)
+                val relayed = r.relay && KeeperVpnService.configureRelay(false, localIp, localIp)
                 val bind = if (relayed) InetAddress.getByName(KeeperVpnService.VIRTUAL_PEER) else local
                 val port = if (relayed) KeeperVpnService.APP_PORT else KeeperVpnService.PEER_PORT
                 if (relayed) Log.i("DirectWifi", "session=${r.id} control host via keeper relay (app $bind:$port, peer $localIp:${KeeperVpnService.PEER_PORT})")
@@ -641,7 +1237,7 @@ class DirectWifiModule(private val context: ReactApplicationContext) : ReactCont
                 // filters WebRTC host candidates against it.
                 val localIp = local.hostAddress
                 if (localIp == null) { fail(r, "Direct control client: local P2P address unavailable"); return@execute }
-                val relayed = KeeperVpnService.configureRelay(true, localIp, ip)
+                val relayed = r.relay && KeeperVpnService.configureRelay(true, localIp, ip)
                 val bind = if (relayed) InetAddress.getByName(KeeperVpnService.VIRTUAL_LOCAL) else local
                 val target = if (relayed) InetAddress.getByName(KeeperVpnService.VIRTUAL_PEER) else InetAddress.getByName(ip)
                 val port = if (relayed) KeeperVpnService.APP_PORT else KeeperVpnService.PEER_PORT
@@ -658,7 +1254,7 @@ class DirectWifiModule(private val context: ReactApplicationContext) : ReactCont
         stage(r, "control-ready")
         main.post {
             if (current(r)) {
-                if (!r.settled) { r.settled = true; r.promise.resolve(true) }
+                if (!r.settled) { r.settled = true; r.promise?.resolve(true) }
                 // advertisedIp is the real P2P interface address even when the
                 // control socket itself lives inside the relay's virtual
                 // subnet. Media candidates must keep using the P2P address.
@@ -707,7 +1303,7 @@ class DirectWifiModule(private val context: ReactApplicationContext) : ReactCont
     private fun fail(r: Run, message: String) {
         main.post {
             if (!current(r)) return@post
-            if (!r.settled) { r.settled = true; r.promise.reject("DIRECT_FAILED", message) }
+            if (!r.settled) { r.settled = true; r.promise?.reject("DIRECT_FAILED", message) }
             emit("onDirectError", r, Arguments.createMap().apply { putString("error", message) }); stop(r, null)
         }
     }
@@ -733,8 +1329,16 @@ class DirectWifiModule(private val context: ReactApplicationContext) : ReactCont
         val stopAt = SystemClock.elapsedRealtime()
         r.stopStartedAt = stopAt
         Log.i("DirectWifi", "teardown begin session=${r.id} requested=${r.requested} live=${r.live} runCleared=true")
+        // The dialing beacons only need to live for the call; drop back to the
+        // normal identity tag so the listener keeps being discoverable.
+        if (beaconOn) {
+            beaconOn = false
+            beaconSession = null
+            advertisedTag = null
+            main.post { applyDeviceTag() }
+        }
         r.live = false; if (run === r) run = null
-        if (!r.settled) { r.settled = true; r.promise.reject("CANCELLED", "Call cancelled") }
+        if (!r.settled) { r.settled = true; r.promise?.reject("CANCELLED", "Call cancelled") }
         try { r.socket?.close() } catch (_: Exception) {}; try { r.server?.close() } catch (_: Exception) {}; r.writer = null
         focus?.let { audio.abandonAudioFocusRequest(it) }; focus = null
         audio.isSpeakerphoneOn = false; audio.mode = AudioManager.MODE_NORMAL
@@ -743,6 +1347,20 @@ class DirectWifiModule(private val context: ReactApplicationContext) : ReactCont
             Log.i("DirectWifi", "teardown exit session=${r.id} reason=no-requested-link elapsedMs=0")
             radioReleased = true
             KeeperVpnService.clearRelay()
+            // A callee that won the GO negotiation owns the group. Leaving it
+            // behind lets the next call re-invoke it with this phone as owner,
+            // so the caller also listens and neither side dials.
+            val m = manager; val c = channel
+            if (m != null && c != null) main.postDelayed({
+                try {
+                    m.requestGroupInfo(c) { group ->
+                        if (group?.isGroupOwner == true && run == null) {
+                            Log.i("DirectWifi", "teardown removeGroup (host) session=${r.id}")
+                            try { m.removeGroup(c, null) } catch (_: Exception) {}
+                        }
+                    }
+                } catch (_: Exception) {}
+            }, 400)
             promise?.resolve(true); return
         }
         stopping = true

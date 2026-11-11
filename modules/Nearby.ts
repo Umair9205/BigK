@@ -8,6 +8,13 @@ if (!NearbyModule) {
 
 const nearbyEmitter = new NativeEventEmitter(NearbyModule);
 
+/** Nearby is unplugged for the Wi-Fi Direct call path (step 4): the live call
+ *  bootstrap is the native P2P listener + dial, so advertising/discovery must
+ *  not touch Bluetooth while this flag is false. */
+export const NEARBY_ENABLED = false;
+
+void (NearbyModule as any).setNearbyEnabled?.(NEARBY_ENABLED).catch?.(() => {});
+
 export interface NearbyPeer {
   connectionId: string;
   peerName: string;
@@ -22,6 +29,7 @@ export interface NearbyConnection {
 type Subscription = { remove: () => void };
 
 const Nearby = {
+  NEARBY_ENABLED,
   isLocationEnabled: (): Promise<boolean> => NearbyModule.isLocationEnabled(),
   openLocationSettings: (): Promise<boolean> => NearbyModule.openLocationSettings(),
   configureAvailability: (uuid: string, name: string, contacts: {uuid: string; name: string}[], audible: boolean): Promise<boolean> =>

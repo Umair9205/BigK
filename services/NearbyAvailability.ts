@@ -34,6 +34,13 @@ export async function ensureLocationEnabled(prompt = true): Promise<void> {
   throw new Error(LOCATION_OFF);
 }
 export function ensureNearbyAvailable(request = true): Promise<void> {
+  // Nearby is unplugged (step 4): the Wi-Fi Direct P2P path is the only live
+  // call bootstrap, so skip the Bluetooth permission group, advertising and
+  // discovery. Location stays required (Wi-Fi Direct peer discovery uses it).
+  if ((Nearby as any).NEARBY_ENABLED === false) {
+    void ensureLocationEnabled().catch(() => {});
+    return Promise.resolve();
+  }
   if (pending) return pending;
   pending = (async () => {
     const { myUUID, myDeviceName } = useAppStore.getState();

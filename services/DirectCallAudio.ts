@@ -47,7 +47,7 @@ export class DirectCallAudio {
   private closing: Promise<unknown> = Promise.resolve();
   isStartingOrActive(id: string) { return this.run?.id === id && this.run.active; }
 
-  start(role: 'caller' | 'callee', peer: string, id: string, callbacks: Callbacks, credentials?: DirectCredentials, peerDeviceName?: string): Promise<void> {
+  start(role: 'caller' | 'callee', peer: string, id: string, callbacks: Callbacks, credentials?: DirectCredentials, peerDeviceName?: string, direct?: { localIp: string }): Promise<void> {
     if (this.run) return this.run.id === id ? this.run.started : Promise.reject(new Error('Another call is active'));
     let resolve!: () => void, reject!: (error: Error) => void;
     const started = new Promise<void>((ok, no) => { resolve = ok; reject = no; });
@@ -69,14 +69,10 @@ export class DirectCallAudio {
         !r.remoteIce ? 'No direct audio address received from the other phone.' : 'Direct audio connectivity checks did not complete.';
       this.fail(r, `Audio setup timed out. ${detail}`);
     }, 90000);
-    void this.prepare(r, credentials).catch(error => this.fail(r, error.message || String(error)));
+    void this.prepare(r, credentials, direct).catch(error => this.fail(r, error.message || String(error)));
     return started;
   }
-  private async prepare(r: Run, credentials?: DirectCredentials) {
-    await this.closing;
-    if (!r.active) return;
-    await nearbyDiscoveryService.stopDiscovery();
-    if (!r.active) return;
+  private async startMediaCapture(r: Run) {
     // Open the microphone while the direct link is still forming. Group
     // creation, DHCP and the control handshake take seconds that must not be
     // spent serially behind a mic open. A failure here surfaces when media is
@@ -96,6 +92,9 @@ export class DirectCallAudio {
         try {
           const msg = JSON.parse(e.data);
           if (msg.sessionId !== r.id) return;
+          // Call-level messages belong to DirectCallFlow/useDirectCall.
+          if (msg.type === 'call-request' || msg.type === 'call-accept'
+              || msg.type === 'call-reject' || msg.type === 'call-end') return;
           if (msg.type === 'end') { this.fail(r, 'Peer ended the call'); return; }
           if (!r.mediaReady) { if (r.pending.length >= 128) throw new Error('Too many setup messages'); r.pending.push(msg); }
           else this.enqueue(r, msg);
@@ -103,14 +102,40 @@ export class DirectCallAudio {
       }),
       wifi.onError(e => { if (r.active && e.sessionId === r.id) this.fail(r, e.error); }),
     );
+  }
+  private async prepare(r: Run, credentials?: DirectCredentials, direct?: { localIp: string }) {
+    // Nearby-free bootstrap: the native dial/listener already owns an
+    // authenticated control socket, so skip discovery, token exchange and
+    // connect(), and go straight to WebRTC over that socket.
+    if (direct) {
+      r.socketReady = true;
+      r.localIp = direct.localIp;
+      await this.closing;
+      if (!r.active) return;
+      // A legacy presence scan running on the shared radio starves the P2P
+      // link. Call-state subscription restarts it when the call returns idle.
+      await nearbyDiscoveryService.stopDiscovery().catch(() => {});
+      if (!r.active) return;
+      await this.startMediaCapture(r);
+      if (!r.active) return;
+      r.callbacks.onStatus('Starting WebRTC audio…');
+      await this.initializeMedia(r);
+      return;
+    }
+    await this.closing;
+    if (!r.active) return;
+    await nearbyDiscoveryService.stopDiscovery();
+    if (!r.active) return;
+    await this.startMediaCapture(r);
+    if (!r.active) return;
     r.callbacks.onStatus('Preparing direct connection…');
     r.handoff = this.handoff(r, credentials);
-    const direct = await r.handoff;
+    const directLink = await r.handoff;
     if (!r.active) return;
     r.callbacks.onStatus('Establishing direct Wi-Fi…');
     // Both sides run the same two-sided framework connect; the GO intent
     // split makes the callee the host deterministically.
-    await wifi.connectPeer(r.id, direct.peerP2pAddress, r.role === 'caller', direct.token);
+    await wifi.connectPeer(r.id, directLink.peerP2pAddress, r.role === 'caller', directLink.token);
   }
   private async handoff(r: Run, credentials?: DirectCredentials): Promise<DirectCredentials> {
     // The address connect() needs is the PEER's, and discovery is the only
@@ -120,8 +145,10 @@ export class DirectCallAudio {
     // with discovery already running — while requestPeers() returns the other
     // phone's address on both test devices. So both sides discover and the
     // address in the signal is only a cross-check, never the one we dial.
-    const peerP2pAddress = await wifi.getPeerP2pAddress(
-      r.peerDeviceName ? [r.peerDeviceName] : []);
+    //
+    // MAC-keyed path: the wrapper resolves the peer by its hashed P2P tag,
+    // reuses the friend's last known MAC as a hint, and persists the result.
+    const peerP2pAddress = await wifi.getPeerP2pAddress(r.peer, r.peerDeviceName);
     if (!r.active) throw new Error('Call stopped');
     if (!peerP2pAddress || peerP2pAddress === '02:00:00:00:00:00') {
       throw new Error('The other phone was not discovered over Wi-Fi Direct');
@@ -252,6 +279,26 @@ export class DirectCallAudio {
       r.chain = r.chain.then(() => this.offer(r, false));
       await r.chain;
     }
+  }
+  /**
+   * Replay a control message captured before this run subscribed (the direct
+   * socket is opened before the callee taps Answer). Public only so
+   * useDirectCall can hand over its pre-audio buffer.
+   */
+  inject(id: string, data: string) {
+    const r = this.run;
+    if (!r || !r.active || r.id !== id) return;
+    try {
+      const msg = JSON.parse(data);
+      if (msg.sessionId !== r.id) return;
+      if (msg.type === 'call-request' || msg.type === 'call-accept'
+          || msg.type === 'call-reject' || msg.type === 'call-end') return;
+      if (msg.type === 'end') { this.fail(r, 'Peer ended the call'); return; }
+      if (!r.mediaReady) {
+        if (r.pending.length >= 128) throw new Error('Too many setup messages');
+        r.pending.push(msg);
+      } else this.enqueue(r, msg);
+    } catch { /* malformed or superseded */ }
   }
   private enqueue(r: Run, message: any) {
     r.chain = r.chain.then(async () => {
@@ -389,7 +436,7 @@ export class DirectCallAudio {
       // wait for create/join: native stop is what cancels those pending operations.
       await r.handoff?.catch(() => {});
       try { await wifi.stop(r.id); }
-      finally { await Nearby.resumeAfterDirectCall(r.id); }
+      finally { if (r.handoff) await Nearby.resumeAfterDirectCall(r.id); }
     }).catch(error => console.warn('[DirectCall] Cleanup', String(error)));
     return this.closing;
   }

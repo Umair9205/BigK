@@ -27,6 +27,10 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Discovery presence tests failed; no APK built.' }
     & node scripts/test-direct-call.cjs
     if ($LASTEXITCODE -ne 0) { throw 'Direct call tests failed; no APK built.' }
+    & node scripts/test-p2p-identity.cjs
+    if ($LASTEXITCODE -ne 0) { throw 'P2P identity/MAC tests failed; no APK built.' }
+    & node scripts/test-direct-flow.cjs
+    if ($LASTEXITCODE -ne 0) { throw 'Direct call flow tests failed; no APK built.' }
     & node scripts/test-direct-call-lifecycle.cjs
     if ($LASTEXITCODE -ne 0) { throw 'Call handoff/lifecycle tests failed; no APK built.' }
     & node scripts/test-offline-audio.cjs
@@ -42,5 +46,5 @@ try {
     if (!(Test-Path -LiteralPath $apkPath)) { throw 'Build did not produce an APK.' }
     Write-Host "Build completed: $apkPath"
     Get-FileHash -Algorithm SHA256 -LiteralPath $apkPath
-    Write-Host 'Install this same APK on both phones. Keep Bluetooth and Location on (always-on local calling); no router or internet is required for the call. If Wi-Fi is off, the app opens the system Wi-Fi panel itself — one toggle continues the call.'
+    Write-Host 'Install this same APK on both phones. Keep Wi-Fi and Location on (always-on local calling); no router or internet is required for the call. If Wi-Fi is off, the app opens the system Wi-Fi panel itself — one toggle continues the call.'
 } finally { Pop-Location }

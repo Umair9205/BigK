@@ -5,7 +5,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { router } from 'expo-router';
 import { useAppStore } from '../store/appStore';
 import { nearbyDiscoveryService as discovery } from '../services/NearbyDiscoveryService';
-import { placeCall } from '../services/OutgoingCall';
+import { placeDirectCall } from '../services/DirectCallFlow';
 import { requireCallNotifications, pauseAvailability, resumeAvailability, setVpnEnabled, useAvailability } from '../services/BackgroundAvailability';
 import CallRingtoneSetting from './CallRingtoneSetting';
 
@@ -58,7 +58,7 @@ export default function CallingHome({ initialTab = 'Calls' }: { initialTab?: Tab
     try {
       if (!useAvailability.getState().enabled) await resumeAvailability(true, true);
       if (useAvailability.getState().enabled) {
-        await placeCall(uuid, label, setDialStatus);
+        await placeDirectCall(uuid, label, setDialStatus);
       } else {
         Alert.alert('Local calling is off', useAvailability.getState().status || 'Turn on “Receive local calls” in Settings, then try again.');
       }
@@ -116,7 +116,7 @@ export default function CallingHome({ initialTab = 'Calls' }: { initialTab?: Tab
       </TouchableOpacity>} />}
     {tab === 'Settings' && <FlatList data={Platform.OS === 'android' ? ['availability','vpn','ringtone','ringtoneSound','battery','permissions','qr','clear'] : ['availability','ringtone','ringtoneSound','battery','permissions','qr','clear']} keyExtractor={x=>x} contentContainerStyle={s.list}
       ListHeaderComponent={<View><TouchableOpacity style={s.profile} accessibilityRole="button" accessibilityLabel="Edit display name" onPress={() => {setDraftName(name || '');setEditingName(true);}}><View style={s.avatar}><Text style={s.initial}>{name?.[0]?.toUpperCase()}</Text></View><View><Text style={s.name}>{name}</Text><Text style={s.meta}>Tap to edit your display name</Text></View></TouchableOpacity>{editingName && <View style={s.row}><TextInput style={[s.input,s.info]} value={draftName} onChangeText={setDraftName} maxLength={60} accessibilityLabel="Display name"/><TouchableOpacity style={s.iconButton} accessibilityRole="button" accessibilityLabel="Save display name" onPress={() => {if(draftName.trim()) void useAppStore.getState().setMyDeviceName(draftName.trim()).then(()=>setEditingName(false));}}><Text style={{color:'#087F69'}}>Save</Text></TouchableOpacity></View>}</View>}
-      ListFooterComponent={<Text style={s.footnote}>Keep Bluetooth and Wi-Fi on. Background availability uses battery and depends on Android permissions and power settings. Force-stopping the app makes it unreachable until reopened. VPN protection keeps background calls reachable; turn it off before opening a banking app or another VPN. Shared-router calling is not included in this build.</Text>}
+      ListFooterComponent={<Text style={s.footnote}>Keep Wi-Fi on. Background availability uses battery and depends on Android permissions and power settings. Force-stopping the app makes it unreachable until reopened. VPN protection keeps background calls reachable; turn it off before opening a banking app or another VPN. Shared-router calling is not included in this build.</Text>}
       renderItem={({item}) => item === 'availability' ? <View style={s.row}><View style={s.info}><Text style={s.name}>Receive local calls</Text><Text style={s.meta}>Automatic nearby availability</Text></View><Switch disabled={availability.busy} value={availability.enabled} onValueChange={on => void (on ? resumeAvailability(true, true) : pauseAvailability())} trackColor={{true:'#087F69',false:'#CAD5D1'}} accessibilityLabel="Receive local calls" /></View>
         : item === 'vpn' ? <View style={s.row}><View style={s.info}><Text style={s.name}>VPN protection</Text><Text style={s.meta}>{!availability.vpnEnabled ? 'Off · banking apps and other VPNs can run' : availability.vpnActive ? 'On · keeps calls reachable with the screen off' : availability.otherVpn ? 'On · waiting for the other VPN to disconnect' : 'On · starting…'}</Text></View><Switch disabled={availability.busy} value={availability.vpnEnabled} onValueChange={on => void setVpnEnabled(on)} trackColor={{true:'#087F69',false:'#CAD5D1'}} accessibilityLabel="VPN protection" /></View>
         : item === 'ringtone' ? <View style={s.row}><View style={s.info}><Text style={s.name}>Incoming call alerts</Text><Text style={s.meta}>Sound and vibration, subject to system settings</Text></View><Switch value={settings.ringtoneEnabled} onValueChange={on => void useAppStore.getState().updateSettings({ringtoneEnabled:on})} accessibilityLabel="Incoming call sound" /></View>

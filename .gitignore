@@ -5,7 +5,6 @@ node_modules/
 .expo/
 dist/
 web-build/
-expo-env.d.ts
 
 # Logs (local test evidence; referenced by filename in the docs)
 *.log

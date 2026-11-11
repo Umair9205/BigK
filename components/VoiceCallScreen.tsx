@@ -2,11 +2,16 @@ import { Ionicons } from '@expo/vector-icons';
 import { StatusBar, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNearbyCall } from '../hooks/useNearbyCall';
+import { useDirectCall } from '../hooks/useDirectCall';
 
-export default function VoiceCallScreen({role, peer, name, endpoint, sessionId}: {
-  role:'caller'|'callee';peer:string;name:string;endpoint:string;sessionId?:string;
-}) {
-  const call = useNearbyCall(role, peer, name, endpoint, sessionId);
+type CallState = 'initiating' | 'ringing' | 'connecting' | 'active' | 'ended';
+type CallControls = {
+  state: CallState; status: string; duration: number; muted: boolean; speaker: boolean;
+  acceptCall: () => unknown; rejectCall: () => unknown; hangUp: () => unknown;
+  toggleMute: () => unknown; toggleSpeaker: () => unknown;
+};
+
+function CallView({role, name, call}: {role: 'caller' | 'callee'; name: string; call: CallControls}) {
   const ringing = role === 'callee' && call.state === 'ringing';
   const duration = `${Math.floor(call.duration/60).toString().padStart(2,'0')}:${(call.duration%60).toString().padStart(2,'0')}`;
   const status = call.status || (call.state==='active' ? duration : ringing ? 'Incoming voice call' : call.state==='ringing' ? 'Calling…' : call.state==='connecting' ? 'Connecting audio…' : call.state==='ended' ? 'Call ended' : 'Preparing call…');
@@ -29,4 +34,21 @@ export default function VoiceCallScreen({role, peer, name, endpoint, sessionId}:
     </View>
   </SafeAreaView>;
 }
+
+/** Legacy Nearby-bootstrapped call screen, kept for the old route. */
+export default function VoiceCallScreen({role, peer, name, endpoint, sessionId}: {
+  role:'caller'|'callee';peer:string;name:string;endpoint:string;sessionId?:string;
+}) {
+  const call = useNearbyCall(role, peer, name, endpoint, sessionId);
+  return <CallView role={role} name={name} call={call}/>;
+}
+
+/** Nearby-free Wi-Fi Direct call screen: socket already authenticated. */
+export function DirectCallScreen({role, peer, name, sessionId, localIp}: {
+  role:'caller'|'callee';peer:string;name:string;sessionId:string;localIp:string;
+}) {
+  const call = useDirectCall(role, peer, name, sessionId, localIp);
+  return <CallView role={role} name={name} call={call}/>;
+}
+
 const s=StyleSheet.create({page:{flex:1,backgroundColor:'#112D29',justifyContent:'space-between',paddingHorizontal:24},top:{alignItems:'center',paddingTop:24,gap:8},brand:{fontSize:12,letterSpacing:3,color:'#AED2C7',fontWeight:'600'},transport:{fontSize:13,color:'#90B1A7'},identity:{alignItems:'center',gap:20},avatar:{width:112,height:112,borderRadius:56,backgroundColor:'#2C5148',alignItems:'center',justifyContent:'center'},initial:{fontSize:48,color:'#D5F2E7'},name:{fontSize:30,fontWeight:'600',color:'white',textAlign:'center'},status:{fontSize:16,color:'#AED2C7',textAlign:'center'},bottom:{paddingBottom:25,gap:24},row:{flexDirection:'row',justifyContent:'center',gap:55},control:{alignItems:'center',gap:10},button:{width:68,height:68,borderRadius:34,justifyContent:'center',alignItems:'center'},controlText:{color:'#E6F3ED',fontSize:13},hint:{fontSize:12,lineHeight:18,color:'#90B1A7',textAlign:'center'}});

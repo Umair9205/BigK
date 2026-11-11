@@ -16,13 +16,15 @@
       android:usesPermissionFlags="neverForLocation"
       tools:targetApi="33"/>
 
-  <!-- Nearby Connections API -->
-  <uses-permission android:name="android.permission.BLUETOOTH"/>
-  <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"/>
-  <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" tools:targetApi="31"/>
-  <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" tools:targetApi="31"/>
-  <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" tools:targetApi="31"/>
-  <uses-permission android:name="android.permission.NFC"/>
+  <!-- Nearby Connections API - UNPLUGGED (step 4): the Wi-Fi Direct P2P transport is
+       the only live call path now, so the Bluetooth permission group is not used and
+       is dropped from the merged manifest for now. Re-enable when Nearby is wired back in. -->
+  <uses-permission android:name="android.permission.BLUETOOTH" tools:node="remove"/>
+  <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" tools:node="remove"/>
+  <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" tools:targetApi="31" tools:node="remove"/>
+  <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" tools:targetApi="31" tools:node="remove"/>
+  <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" tools:targetApi="31" tools:node="remove"/>
+  <uses-permission android:name="android.permission.NFC" tools:node="remove"/>
 
   <!-- Audio -->
   <uses-permission android:name="android.permission.RECORD_AUDIO"/>

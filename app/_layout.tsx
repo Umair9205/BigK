@@ -2,11 +2,15 @@ import { router, Stack } from 'expo-router';
 import { useEffect, useRef } from 'react';
 import { Alert, AppState } from 'react-native';
 import Nearby from '../modules/Nearby';
+import wifi from '../modules/DirectWifi';
 import { signalingManager } from '../services/CallSignaling';
 import { useAppStore } from '../store/appStore';
 import { callStateManager } from '../services/CallStateManager';
 import { resumeAvailability, startAvailabilityLifecycle, callNotifications } from '../services/BackgroundAvailability';
 import { ensureBatteryExemption } from '../services/BatteryExemption';
+import {
+  setPendingIncoming, peekPendingIncoming, clearPendingIncoming, reject as rejectDirectCall,
+} from '../services/DirectCallFlow';
 
 export default function RootLayout() {
   const seenCalls = useRef(new Set<string>());
@@ -24,6 +28,10 @@ export default function RootLayout() {
   useEffect(() => {
     if (myUUID) {
       signalingManager.setMyUUID(myUUID);
+      // Publish the hashed P2P identity tag so the peer can match this phone
+      // by MAC-keyed discovery instead of guessing "the single available
+      // device". Applied once Wi-Fi is available; remembered otherwise.
+      void wifi.setDeviceTag(myUUID);
       console.log('[Layout] Signaling manager initialized with UUID:', myUUID);
     }
   }, [myUUID]);
@@ -124,6 +132,63 @@ export default function RootLayout() {
       signalingManager.off('call-request', handler);
     };
   }, [myUUID, isFriendByUUID]);
+
+  // Nearby-free incoming call. The native listener has already accepted an
+  // authenticated control socket; this only surfaces it and routes to the
+  // direct call screen. The legacy Nearby handler above is left compiled but
+  // no longer receives call-requests from the live caller.
+  useEffect(() => {
+    const open = (call: {sessionId: string; from: string; callerName: string; localIp: string}) => {
+      router.push({
+        pathname: '/incoming-call',
+        params: {
+          callerName: call.callerName, callerUUID: call.from,
+          sessionId: call.sessionId, localIp: call.localIp,
+        },
+      });
+    };
+    const listener = wifi.onIncomingCall(e => {
+      const store = useAppStore.getState();
+      if (!store.settings.scanningEnabled || !e.from || e.from === myUUID) {
+        void rejectDirectCall(e.sessionId, e.from); return;
+      }
+      if (!isFriendByUUID(e.from)) {
+        void rejectDirectCall(e.sessionId, e.from); return;
+      }
+      if (seenCalls.current.has(e.sessionId)) return;
+      if (callStateManager.getState() !== 'idle') {
+        void rejectDirectCall(e.sessionId, e.from); return;
+      }
+      seenCalls.current.add(e.sessionId);
+      if (seenCalls.current.size > 64) {
+        seenCalls.current.delete(seenCalls.current.values().next().value!);
+      }
+      const savedName = store.getFriendByUUID(e.from)?.name || e.callerName || 'Contact';
+      const call = { sessionId: e.sessionId, from: e.from, callerName: savedName, localIp: e.localIp };
+      // Do not reserve the call state here: the incoming screen's hook owns the
+      // session. If the notification is ignored, the state stays idle so the
+      // next call is not rejected by a stale ring.
+      void callNotifications.showIncoming(e.sessionId, savedName, store.settings.ringtoneEnabled)
+        .catch((error: Error) => console.warn('[Incoming notification]', error.message));
+      if (AppState.currentState === 'active') {
+        clearPendingIncoming(e.sessionId);
+        open(call);
+      } else {
+        setPendingIncoming(call);
+      }
+    });
+    const appState = AppState.addEventListener('change', state => {
+      if (state !== 'active') return;
+      const pending = peekPendingIncoming();
+      if (!pending) return;
+      if (callStateManager.getState() !== 'idle') {
+        clearPendingIncoming(pending.sessionId); return;
+      }
+      clearPendingIncoming(pending.sessionId);
+      open(pending);
+    });
+    return () => { listener.remove(); appState.remove(); };
+  }, [isFriendByUUID, myUUID]);
 
   // Redirect to setup after loadData completes on first launch
   useEffect(() => {

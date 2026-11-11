@@ -65,6 +65,12 @@ class NearbyTransport private constructor(private val context: Context) {
     // timer bounds the staleness instead of trying to observe the drop.
     private var advertisingStartedAt = 0L
     private val peerIdentities = mutableMapOf<String, String>()
+    // Nearby is unplugged for the Wi-Fi Direct call path (step 4). The JS bridge
+    // sets this from modules/Nearby.ts; while false the transport never touches
+    // Bluetooth advertising or discovery, so the phone stops powering up BT.
+    @Volatile private var enabled = true
+        private set
+    fun setEnabled(enabled: Boolean) { this.enabled = enabled }
     fun configure(uuid: String, name: String, contacts: String, audible: Boolean) {
         prefs.edit().putString("uuid", uuid).putString("name", name)
             .putString("contacts", contacts).putBoolean("audible", audible).apply()
@@ -76,7 +82,7 @@ class NearbyTransport private constructor(private val context: Context) {
     } catch (_: Exception) { null }
 
     fun restore() { main.post {
-        if (prefs.getBoolean("paused", true) || directSession != null || advertising || restoring) return@post
+        if (!enabled || prefs.getBoolean("paused", true) || directSession != null || advertising || restoring) return@post
         val uuid = prefs.getString("uuid", "") ?: ""
         if (uuid.isBlank()) return@post
         identity = "$uuid|${prefs.getString("name", "BigK")}"
@@ -183,7 +189,7 @@ class NearbyTransport private constructor(private val context: Context) {
      *  dropped advertisement makes the phone unreachable — neither may depend on JS
      *  being alive to repair. Called every minute while the service runs. */
     fun healthWatchdog() { main.post {
-        if (prefs.getBoolean("paused", true)) return@post
+        if (!enabled || prefs.getBoolean("paused", true)) return@post
         val direct = directSession
         if (direct != null) {
             // A handoff whose cleanup never confirmed keeps Nearby suspended.
@@ -301,6 +307,7 @@ class NearbyTransport private constructor(private val context: Context) {
 
     fun startAdvertising(uuid: String, name: String, promise: Promise) {
         main.post {
+            if (!enabled) { promise.resolve(false); return@post }
             identity = "$uuid|$name"
             if (directSession != null) {
                 promise.reject("WIFI_CLOSING", "The previous call link is still closing. If this persists, turn Wi-Fi off and on, then reopen BigK.")
@@ -325,6 +332,7 @@ class NearbyTransport private constructor(private val context: Context) {
     fun startDiscovery(uuids: ReadableArray, promise: Promise) {
         val requested = (0 until uuids.size()).mapNotNull { uuids.getString(it) }.toSet()
         main.post {
+            if (!enabled) { promise.resolve(false); return@post }
             targets = requested
             if (directSession != null || session != null) { promise.resolve(false); return@post }
             if (discovering) {
