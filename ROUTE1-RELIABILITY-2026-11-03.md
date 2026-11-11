@@ -8,6 +8,8 @@ No Wi-Fi toggling, no manual preconditions, no error string that tells the user
 to go fix something. Background receive behaves like WhatsApp. Setup latency
 stays comfortable.
 
+> Log excerpts below redact the application package and wakelock tag as `<app>`.
+
 ---
 
 ## Environment these rounds ran on
@@ -271,9 +273,9 @@ problem surfaced.
 22:58:38  … still fine                  ← 7th and last measurement
 22:58:35  user presses Home (APP_SWITCH → XOSLauncher)
 22:58:40  Usf_Hiber: enter FrozenState → freeze uid 10388   ← 5 s later
-          proxyWakeLock: add … 'kelakonnect:availability LONG
+          proxyWakeLock: add … '<app>:availability LONG
           proxyManager: p_service / p_alarm / p_sensor / p_job
-22:59:00  proxyWakeLock: drop … 'kelakonnect:availability
+22:59:00  proxyWakeLock: drop … '<app>:availability
           (process never runs again)
 ```
 
@@ -287,7 +289,7 @@ service carries `foregroundServiceType="connectedDevice"` and `stopWithTask="fal
 **Transsion's power manager froze it anyway.** Its rule, as logged:
 *backgrounded + no network traffic (`isTrafficActive … speed :0`) = freeze after
 5 seconds.* Our app was already on its list —
-`Usf_Hiber/config: pkgName: com.anonymous.kelakonnect add to third app list` —
+`Usf_Hiber/config: pkgName: com.anonymous.<app> add to third app list` —
 and it neutralised **everything**: wake lock, service, alarms, jobs, sensors.
 
 None of the new stop diagnostics fired, because `onDestroy` never runs on a
@@ -342,10 +344,10 @@ uid now **10391** (reinstalled; round 18 was 10388), app pid **21836**.
 | 00:18:59 | `[BatteryExemption] system dialog requested` → system dialog shown |
 | 00:19:01 | **`[BatteryExemption] after prompt: unrestricted=true`** — exemption GRANTED |
 | 00:19:06, 00:19:11 | two clean probe cycles, 5 s apart (watchdog healthy) |
-| 00:19:09 | Home pressed (`APP_SWITCH … prevPkgName:com.anonymous.kelakonnect`) |
+| 00:19:09 | Home pressed (`APP_SWITCH … prevPkgName:com.anonymous.<app>`) |
 | 00:19:14.08 | `PowerManagerService: Going to sleep` (screen off) |
 | 00:19:14.49 | **`Usf_Hiber/appStateMachine: uid:10391 enter FrozenState`** — frozen 13 s after the grant |
-| 00:19:14.49 | `proxyWakeLock: add/drop … 'kelakonnect:availability'`; `p_service`, `p_alarm`, `p_sensor`, `p_job` all proxied |
+| 00:19:14.49 | `proxyWakeLock: add/drop … '<app>:availability'`; `p_service`, `p_alarm`, `p_sensor`, `p_job` all proxied |
 | 00:19:17 | `netd: socketDestroy([10391])` — our sockets torn down |
 | 00:19:14 → end | **pid 21836 produces ZERO log lines** for 2 min 15 s until capture ends |
 
@@ -364,7 +366,7 @@ uid now **10391** (reinstalled; round 18 was 10388), app pid **21836**.
 3. **The freeze is background-triggered, not screen-off-triggered** — freeze #1
    at 00:18:15 happened with the screen still on.
 4. **GMS-side presence survived again**: `NearbyMediums: Current Tracked Scanning
-   Clients … com.kelakonnect.nearby.control.v2` kept printing every ~8 s from
+   Clients … com.<app>.nearby.control.v2` kept printing every ~8 s from
    00:19:17 to 00:21:21 — the second consecutive confirmation that GMS holds our
    advertisement/scanner while we are frozen (round-18 finding: +3 min).
 5. `Usf_Hiber/config: … add to third app list` — we are explicitly classified
@@ -481,7 +483,7 @@ uid 10392, process 8112.
 | 02:12:32.081 | **Home** (APP_SWITCH → XOSLauncher) |
 | 02:12:35.765 | watchdog probe still running post-Home ✓ |
 | 02:12:37.087 | `isTrafficActive uid:10392 speed :0` → `enter FrozenState` → **freeze, 5 s after Home** |
-| 02:12:37.097 | `kelakonnect:availability` wakelock force-released; `p_service/p_alarm/p_sensor/p_job` proxied |
+| 02:12:37.097 | `<app>:availability` wakelock force-released; `p_service/p_alarm/p_sensor/p_job` proxied |
 | 02:12:40.104 | `netd socketDestroy(UidRange{10392})` — all sockets killed 3 s after the freeze |
 | 02:14:32 | screen off (timeout) |
 | 02:16:04.670 | LcdOn pass re-evaluates `uid:10392 speed :0` — **no unfreeze** (weather app 10266 unfroze with `reason:LcdOn` in the same pass) |
@@ -579,7 +581,7 @@ counter line proves the ticker had been running 20 s.
 | 21:46:44.226 | **Home** (APP_SWITCH → XOSLauncher) |
 | 21:46:47.726 | `KeepAlive: n=20 sent=380 err=0 rxPkt=54 tlsOk=10 tlsFail=22 txB=351036 rxB=56626 phase=burst wifi=true` |
 | 21:46:49.245 | `isTrafficActive uid:10393 speed :8` → `enter FrozenState` → **freeze, Home +5.0 s** |
-| 21:46:49.252 | `kelakonnect:availability` wakelock force-released; `p_service/p_alarm/p_sensor/p_job` proxied |
+| 21:46:49.252 | `<app>:availability` wakelock force-released; `p_service/p_alarm/p_sensor/p_job` proxied |
 | 21:46:52.262 | `netd socketDestroy(10393)` |
 | after | pid 16098 total silence (own last line 21:46:47.728), no n=30 line, no `stopped`; capture ends 21:49:04 with the process still frozen |
 
@@ -625,7 +627,7 @@ Infinix fix.
    `system_server` above all.
 2. **GMS kept OUR Nearby discovery alive through the whole freeze.**
    `NearbyMediums: Current Tracked Scanning Clients are : {…,
-   com.kelakonnect.nearby.control.v2}` printed every ~8 s from 21:46:42 to
+   com.<app>.nearby.control.v2}` printed every ~8 s from 21:46:42 to
    21:48:59 — that is our own `SERVICE_ID` (`NearbyTransport.kt`), so GMS
    kept scanning **on our behalf for 2+ minutes after the freeze at
    21:46:49** (pre-freeze probes also showed `advertising=true`; same
@@ -892,8 +894,8 @@ Remaining options for the Infinix, in the order they should be tried:
 4. **VPN own-tunnel build — BUILT AND PASSING (Nov 6, round 23).** See the
    round-23 section below. The strongest *prevention* evidence on the device
    (the `importantScene: VPN` finding above) held up: with our own `VpnService`
-   tunnel up, the engine logs `importantScene: VPN: packageName=com.anonymous.
-   kelakonnect` every 30 s and `fastState: uid=10397 is pending`, with zero
+   tunnel up, the engine logs `importantScene: VPN: packageName=com.anonymous.<app>`
+   every 30 s and `fastState: uid=10397 is pending`, with zero
    freezes across screen-on, screen-off and the lock screen. One-time consent
    dialog, status-bar key icon, defers to any other active VPN, and (round 24)
    a real local call relay on `10.111.222.0/24` instead of a dummy route; Play
@@ -934,7 +936,7 @@ grant; note a reinstall resets that op to `default` (`cmd appops get …` showed
 
 - **Screen on, at Home: no freeze for 3+ minutes** (previous death: Home
   +4–5 s). Watchdog/P2P lines kept ticking every 5 s and the engine logged
-  `importantScene: float_window: packageName=com.anonymous.kelakonnect`
+  `importantScene: float_window: packageName=com.anonymous.<app>`
   every 30 s.
 - **Screen off / locked: still freezes.** With `KEYCODE_SLEEP` the window's
   surface hides (`isVisible=false`), the scene disappears, and the engine's
@@ -964,7 +966,7 @@ sequence):
 | Phase | Duration | Result |
 |---|---|---|
 | Home, screen on | 65 s | no freeze; `importantScene: float_window` + `VPN` |
-| screen off (`KEYCODE_SLEEP`) | 150 s | **no freeze**; `VPN: packageName=com.anonymous.kelakonnect` every 30 s |
+| screen off (`KEYCODE_SLEEP`) | 150 s | **no freeze**; `VPN: packageName=com.anonymous.<app>` every 30 s |
 | wake to keyguard | 60 s | **no freeze** |
 
 Evidence excerpts:
@@ -973,7 +975,7 @@ Evidence excerpts:
 22:08:34.558 W Usf_Hiber/fastState: uid=10397 is pending
 22:09:47.394 I Usf_Hiber/importantScene: isTrafficActive uid:10397 speed :2
 22:09:47.395 I Usf_Hiber/importantScene: uid:10397 speed :2
-22:09:47.395 I Usf_Hiber/importantScene: VPN: packageName=com.anonymous.kelakonnect
+22:09:47.395 I Usf_Hiber/importantScene: VPN: packageName=com.anonymous.<app>
 ```
 
 192 log lines from the app pid in the same window (`P2PProbe` every 5 s,
@@ -982,7 +984,7 @@ logs `is pending` instead of freezing; the earlier `stateManager: freeze uid`
 path never fires. System confirmation of the tunnel:
 
 ```
-NetworkAgentInfo{network{570} … ni{VPN CONNECTED extra: VPN:com.anonymous.kelakonnect}
+NetworkAgentInfo{network{570} … ni{VPN CONNECTED extra: VPN:com.anonymous.<app>}
   … InterfaceName: tun0 … OwnerUid: 10397 … sessionId=BigK background receive}
 Usf_Hiber/networkDetectorService: changedNetwork: netType=17, net=VPN
 ```
@@ -1038,14 +1040,14 @@ replaced by a real local relay:
 **Soak result (Nov 8).** 15 minutes with `mWakefulness=Dozing`, captured from
 `-b main,system` (120,115 lines, 00:48–01:06): **zero `freeze uid: 10399`**
 (the only textual matches were adbd echoes of the grep command itself),
-**36 `importantScene: VPN: packageName=com.anonymous.kelakonnect`** lines (one
+**36 `importantScene: VPN: packageName=com.anonymous.<app>`** lines (one
 per 30 s engine cycle), and `P2PProbe` ticks through 01:06:45. Representative
 cycle:
 
 ```
 01:05:48.437  3409  3537 I Usf_Hiber/importantScene: isTrafficActive uid:10399 speed :4
 01:05:48.438  3409  3537 I Usf_Hiber/importantScene: uid:10399 speed :4
-01:05:48.438  3409  3537 I Usf_Hiber/importantScene: VPN: packageName=com.anonymous.kelakonnect
+01:05:48.438  3409  3537 I Usf_Hiber/importantScene: VPN: packageName=com.anonymous.<app>
 01:06:45.806  1719  1719 I P2PProbe: [watchdog] peers=0
 ```
 
@@ -1066,7 +1068,7 @@ the direct path, but the freezer exemption is WARP's, not ours).
 
 - **Wakelock removed.** `AvailabilityService` no longer holds `PARTIAL_WAKE_LOCK`;
   the VPN exemption is the freeze fix and the CPU is allowed to sleep between
-  packets. The old tag `kelakonnect:availability` should no longer appear in
+  packets. The old tag `<app>:availability` should no longer appear in
   `dumpsys power`. `TrafficKeepAlive` still feeds `isTrafficActive` while the
   CPU is awake.
 - **VPN protection toggle.** A user-facing switch (Settings row `VPN protection`
@@ -1096,9 +1098,9 @@ the direct path, but the freezer exemption is WARP's, not ours).
 
 - **No-wakelock soak.** 16.5 min screen-off (`mWakefulness=Dozing`), `main,system`
   buffer, 40,407 lines (01:48-02:04): **0 real `freeze uid: 10399`**,
-  **72 `importantScene: VPN: packageName=com.anonymous.kelakonnect`** lines, and
+  **72 `importantScene: VPN: packageName=com.anonymous.<app>`** lines, and
   `P2PProbe` ticks through 02:04:40. `dumpsys power` shows no new
-  `kelakonnect:availability` ACQ line (last one is 00:48, from the old build).
+  `<app>:availability` ACQ line (last one is 00:48, from the old build).
   The VPN exemption alone keeps the app alive with the CPU allowed to sleep.
 - **VPN toggle.** Off: `tun0` gone within ~1 s, `VPN protection disabled by
   user`, service destroyed. On: `VPN protection enabled by user`, tunnel
@@ -1163,7 +1165,7 @@ Availability: VPN toggle requested: on|off
    `P2PProbe: [watchdog] …` **at 5-second intervals for at least 2 minutes
    after Home** — now including with the screen off and on the lock screen.
    Grep `Availability: VPN keeper tunnel established` once at startup,
-   `importantScene: VPN: packageName=com.anonymous.kelakonnect` every 30 s,
+   `importantScene: VPN: packageName=com.anonymous.<app>` every 30 s,
    and `fastState: uid=<ours> is pending`. The pass condition is **no**
    `stateManager: freeze uid: <ours>` line at all.
    Also grep `[BatteryExemption]` for `after prompt: unrestricted=true` and
@@ -1172,7 +1174,7 @@ Availability: VPN toggle requested: on|off
 3. If probes stop, grep for the new stop lines first —
    `Availability: Stopping:` / `Service destroyed; watchdog cancelled` — and
    then for the OEM freezer:
-   `Usf_Hiber.*<our-uid>` / `proxyWakeLock.*kelakonnect`. If the VPN is the
+   `Usf_Hiber.*<our-uid>` / `proxyWakeLock.*<app>`. If the VPN is the
    suspect, check `dumpsys connectivity | grep 'VPN CONNECTED'` and
    `Availability: VPN keeper (tunnel established|revoked|waiting for user
    consent)`.

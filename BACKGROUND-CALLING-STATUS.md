@@ -36,7 +36,7 @@ Shared-router calling, cryptographic peer authentication and the rest of the pro
 
 The current TypeScript check, all 45 script checks and full offline release build pass. Application-logic checks and source assertions cover availability startup/pause, native registration, transport ownership, invitation restoration, and cancellation. Source assertions are structural checks, not executed Android lifecycle tests. Real-device background reception and audible ringing remain unverified.
 
-Fresh APK: `C:\Users\umair\OneDrive\Documents\kela-konnect\android\app\build\outputs\apk\release\app-release.apk`, built 1 October 2026 at 16:53 local time. SHA-256: `A50AB2CD489DD778E454CF88332158F6FD444FC9588C33B5DAF1D0D5B70FEC1A`. Install the same APK on both phones; no installation was performed by this task.
+Fresh APK: `android\app\build\outputs\apk\release\app-release.apk`, built 1 October 2026 at 16:53 local time. SHA-256: `A50AB2CD489DD778E454CF88332158F6FD444FC9588C33B5DAF1D0D5B70FEC1A`. Install the same APK on both phones; no installation was performed by this task.
 
 Run TypeScript checking and all five calling scripts under `scripts/test-*.cjs`. These are mocked application-logic checks plus source assertions, not Android lifecycle instrumentation or evidence that background phone calls work. A complete release build and inspection on both devices are required before treating background behaviour as verified.
 

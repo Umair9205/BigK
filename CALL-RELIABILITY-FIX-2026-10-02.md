@@ -43,7 +43,7 @@ No new transport, internet fallback, or audio codec was introduced.
 
 ## Rebuild and test
 
-Build from `C:\Users\umair\OneDrive\Documents\kela-konnect` using:
+Build from the repository root using:
 
 ```powershell
 npx expo run:android --variant release --device

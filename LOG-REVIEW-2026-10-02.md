@@ -117,7 +117,7 @@ TypeScript and 49 automated checks passed. These include mocked behavior and str
 Build from the user's normal PowerShell with the established JDK 17 configuration, then install only after BUILD SUCCESSFUL:
 
 ```powershell
-Set-Location 'C:\Users\umair\OneDrive\Documents\kela-konnect'
+# from the repository root
 npx expo run:android --variant release --device
 ```
 

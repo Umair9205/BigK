@@ -19,7 +19,8 @@ pipeline remains in the source tree but is not used by the call screens.
 Run in your normal Windows PowerShell:
 
 ```powershell
-& "C:\Users\umair\OneDrive\Documents\kela-konnect\scripts\build-offline-call.ps1"
+# from the repository root
+& .\scripts\build-offline-call.ps1
 ```
 
 Only install after the script reports success. A failed build can leave an old APK

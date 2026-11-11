@@ -1,4 +1,4 @@
-# BigK (Kela-Konnect)
+# BigK
 
 **Local, offline voice calling between two Android phones.** No phone number, no account, no mobile data, no server. Press **Call** and the other phone rings — even with the screen off.
 
@@ -151,19 +151,25 @@ adb -s <phone-serial> install -r android\app\build\outputs\apk\release\app-relea
 
 ### Re-grant permissions after every `adb install -r`
 
-`adb install -r` can reset runtime grants. On each phone:
+`adb install -r` can reset runtime grants. On each phone, resolve BigK's application ID first, then use it for the grants:
 
 ```powershell
-adb -s <phone-serial> shell pm grant com.anonymous.kelakonnect android.permission.ACCESS_FINE_LOCATION
-adb -s <phone-serial> shell pm grant com.anonymous.kelakonnect android.permission.ACCESS_COARSE_LOCATION
-adb -s <phone-serial> shell pm grant com.anonymous.kelakonnect android.permission.RECORD_AUDIO
-adb -s <phone-serial> shell pm grant com.anonymous.kelakonnect android.permission.POST_NOTIFICATIONS
+$pkg = (adb -s <phone-serial> shell pm list packages com.anonymous |
+  ForEach-Object { ($_ -replace '^package:', '').Trim() } |
+  Select-Object -First 1)
+
+adb -s <phone-serial> shell pm grant $pkg android.permission.ACCESS_FINE_LOCATION
+adb -s <phone-serial> shell pm grant $pkg android.permission.ACCESS_COARSE_LOCATION
+adb -s <phone-serial> shell pm grant $pkg android.permission.RECORD_AUDIO
+adb -s <phone-serial> shell pm grant $pkg android.permission.POST_NOTIFICATIONS
 ```
+
+If more than one `com.anonymous.*` app is installed, inspect the list and set `$pkg` explicitly to BigK's ID from `android/app/build.gradle`.
 
 On Samsung (and other One UI devices), allow the incoming-call overlay:
 
 ```powershell
-adb -s <phone-serial> shell appops set com.anonymous.kelakonnect SYSTEM_ALERT_WINDOW allow
+adb -s <phone-serial> shell appops set $pkg SYSTEM_ALERT_WINDOW allow
 ```
 
 `POST_NOTIFICATIONS` only exists on Android 13+. On Android 10 the `pm grant` for it may fail harmlessly.
@@ -223,7 +229,7 @@ services/                 DirectCallFlow, DirectCallAudio, P2pIdentity,
                           BackgroundAvailability, CallStateManager, WebRTC, ringtone
 modules/                  JS wrappers for the native modules (DirectWifi, Nearby, …)
 store/                    Zustand app store (identity, friends, history, settings)
-android/app/src/main/java/com/anonymous/kelakonnect/
+android/app/src/main/java/  Native Android sources:
                           DirectWifiModule.kt, DirectControlSocket.java,
                           AvailabilityService.kt, KeeperVpnService.kt,
                           CallForegroundService.kt, NearbyTransport.kt, Opus JNI
@@ -254,7 +260,7 @@ __tests__/                Jest tests (Opus module)
 | Call connects but there is no audio | Microphone permission; media volume; speaker route; try ending and redialing. |
 | Callee does not ring with the screen off | Battery exemption granted; BigK's foreground notification present; VPN protection on; OEM freezer not force-stopping the app. |
 | "VPN protection: waiting for the other VPN" | Android has one VPN slot. Disconnect WARP/other VPN, or accept reduced screen-off protection. Turn BigK's VPN off for banking apps. |
-| Incoming call overlay does not show on Samsung | `appops set com.anonymous.kelakonnect SYSTEM_ALERT_WINDOW allow`. |
+| Incoming call overlay does not show on Samsung | `appops set $pkg SYSTEM_ALERT_WINDOW allow` (with `$pkg` set as above). |
 | Discovery worked, then stalled after ~40 s | Known DNS-SD channel staleness (`reason=0` on `discoverServices`). Reopen the app or toggle Wi-Fi to rebuild the channel. |
 | Both phones connect but the control socket deadlocks | The client-dials rule handles both group roles. If it recurs, capture logcat from both phones and check for `callee is the group client; dialling the caller`. |
 

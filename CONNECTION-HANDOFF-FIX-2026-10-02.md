@@ -30,15 +30,15 @@ The previous 30-second warm **Wi-Fi Direct group** retention is removed. This tr
 
 ## Compatibility
 
-Install the newly built APK on **both phones**. The bootstrap service ID is now `com.kelakonnect.nearby.control.v2`, and media negotiation uses `webrtc-direct-v2`. Old and new builds intentionally do not discover each other. Contacts are not erased and the application/package ID is unchanged.
+Install the newly built APK on **both phones**. The bootstrap service ID is now `com.<redacted>.nearby.control.v2`, and media negotiation uses `webrtc-direct-v2`. Old and new builds intentionally do not discover each other. Contacts are not erased and the application/package ID is unchanged.
 
 Normal-power advertising/discovery remain enabled. Outgoing bootstrap connections request low power and `NON_DISRUPTIVE`; these are preferences, not the ownership guarantee. The acknowledged handoff is the actual conflict fix.
 
 ## Main changed files
 
-- `android/app/src/main/java/com/anonymous/kelakonnect/NearbyTransport.kt`
-- `android/app/src/main/java/com/anonymous/kelakonnect/NearbyModule.kt`
-- `android/app/src/main/java/com/anonymous/kelakonnect/DirectWifiModule.kt`
+- `android/app/src/main/java/<package>/NearbyTransport.kt`
+- `android/app/src/main/java/<package>/NearbyModule.kt`
+- `android/app/src/main/java/<package>/DirectWifiModule.kt`
 - `modules/Nearby.ts`, `modules/DirectWifi.ts`
 - `services/DirectCallAudio.ts`, `services/CallSignaling.ts`
 - `services/OutgoingCall.ts`, `services/NearbyDiscoveryService.ts`
@@ -63,7 +63,7 @@ Selected original native/UI/build-script files were copied to `.codex-backups/co
 In a normal PowerShell window:
 
 ```powershell
-cd C:\Users\umair\OneDrive\Documents\kela-konnect
+# from the repository root
 & .\scripts\build-offline-call.ps1
 ```
 
